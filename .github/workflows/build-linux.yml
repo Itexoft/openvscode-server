@@ -19,13 +19,15 @@ jobs:
             artifact: openvscode-server-linux-x64
 
     env:
-      # NODE_OPTIONS: --require=/opt/node-shims/fake-os-mem.js --max-old-space-size=65536
       GITHUB_TOKEN: ${{ github.token }}
       GH_TOKEN: ${{ github.token }}
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
       npm_config_arch: ${{ matrix.vscode_arch }}
       VSCODE_ARCH: ${{ matrix.vscode_arch }}
+      NODE_OPTIONS: --max-old-space-size=8192
+      MALLOC_ARENA_MAX: "2"
+      CI: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -35,33 +37,41 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
 
-      - if: matrix.platform == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config dbus xvfb libgtk-3-0 libxkbfile-dev libkrb5-dev libgbm1 rpm libsecret-1-dev jq
-
-      - if: matrix.platform == 'win32'
-        run: git config --system core.longpaths true
-        shell: pwsh
-
       - run: npm ci
       - run: npm ci
         working-directory: remote
 
       - run: npm run server:init
 
-      - if: matrix.platform != 'win32'
-        run: |
-          npm run gulp vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}-min
-          mv ../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }} ../vscode-server-${{ matrix.platform }}-${{ matrix.vscode_arch }}
-          tar -czf ${{ matrix.artifact }}.${{ matrix.archive }} -C .. vscode-server-${{ matrix.platform }}-${{ matrix.vscode_arch }}
+      - run: |
+          npm run gulp compile-build-without-mangling
+          npm run gulp extensions-ci
+          npm run gulp minify-vscode-reh
+          npm run gulp vscode-web-min-ci
 
-      - if: matrix.platform == 'win32'
+      - run: npm run gulp vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}-min-ci
+
+      - name: Locate output dir
+        id: find_out
         run: |
-          npm run gulp vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}-min
-          Move-Item ..\\vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }} ..\\vscode-server-${{ matrix.platform }}-${{ matrix.vscode_arch }}
-          Compress-Archive -Path ..\\vscode-server-${{ matrix.platform }}-${{ matrix.vscode_arch }} -DestinationPath ${{ matrix.artifact }}.${{ matrix.archive }}
-        shell: pwsh
+          set -euo pipefail
+          name="vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}"
+          for d in "./$name" "../$name" "./.build/$name" "./.build/linux/$name"; do
+            if [ -d "$d" ]; then
+              echo "out_dir=$d" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          find . -maxdepth 4 -type d -name "vscode-reh-*"
+          exit 1
+
+      - run: |
+          set -euo pipefail
+          src="${{ steps.find_out.outputs.out_dir }}"
+          base="${{ matrix.artifact }}"
+          tmpdir="$(mktemp -d)"
+          cp -R "$src" "$tmpdir/$base"
+          tar -czf "${base}.${{ matrix.archive }}" -C "$tmpdir" "$base"
 
       - uses: actions/upload-artifact@v4
         with:
