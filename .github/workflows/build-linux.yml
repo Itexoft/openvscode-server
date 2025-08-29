@@ -19,7 +19,7 @@ jobs:
             artifact: openvscode-server-linux-x64
 
     env:
-      NODE_OPTIONS: --require=/opt/node-shims/fake-os-mem.js --max-old-space-size=65536
+      # NODE_OPTIONS: --require=/opt/node-shims/fake-os-mem.js --max-old-space-size=65536
       GITHUB_TOKEN: ${{ github.token }}
       GH_TOKEN: ${{ github.token }}
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
