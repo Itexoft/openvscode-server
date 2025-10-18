@@ -1,0 +1,205 @@
+name: Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            vscode_arch: x64
+            archive: tar.gz
+            artifact: openvscode-server-linux-x64-web
+
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ github.token }}
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      npm_config_arch: ${{ matrix.vscode_arch }}
+      VSCODE_ARCH: ${{ matrix.vscode_arch }}
+      NODE_OPTIONS: --max-old-space-size=8192
+      MALLOC_ARENA_MAX: "2"
+      CI: "1"
+      VSCODE_OSS_BUILD: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: clean workspace
+        run: |
+          set -euxo pipefail
+          git reset --hard
+          git clean -xfd
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+      - run: npm ci
+        working-directory: remote
+
+      - name: bootstrap
+        run: |
+          set -euxo pipefail
+          npm run server:init
+          npm run gulp compile-build-without-mangling
+          npm run gulp extensions-ci
+          npm run gulp minify-vscode-reh
+          npm run gulp minify-vscode-reh-web
+          npm run gulp vscode-web-min-ci || npm run gulp vscode-web-min
+
+      - name: locate web out dir
+        id: find_out_web
+        run: |
+          set -euxo pipefail
+
+          name_a="vscode-reh-web-${{ matrix.platform }}-${{ matrix.vscode_arch }}"
+          name_b="${name_a}-min"
+          roots=( "." ".." "./.build" "./.build/${{ matrix.platform }}" )
+          for root in "${roots[@]}"; do
+            for n in "$name_a" "$name_b"; do
+              if [ -d "$root/$n" ]; then
+                echo "Found at $root/$n"
+                echo "out_dir=$root/$n" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            done
+          done
+
+          found="$(
+            (for root in "${roots[@]}"; do
+               find "$root" -maxdepth 6 -type d \( -name "$name_a" -o -name "$name_b" \) -print -quit
+             done) || true
+          )"
+
+          if [ -n "${found:-}" ] && [ -d "$found" ]; then
+            echo "Found via find: $found"
+            echo "out_dir=$found" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "FAILED to locate $name_a (or -min) under: ${roots[*]}"
+          find . -maxdepth 6 -type d -name "vscode-reh-web-*"
+          exit 1
+          
+      - name: package web
+        id: pack_web
+        run: |
+          set -euxo pipefail
+          src="${{ steps.find_out_web.outputs.out_dir }}"
+          if [ -z "${src:-}" ] || [ ! -d "$src" ]; then
+            echo "WARN: steps.find_out_web.outputs.out_dir is empty; trying autodetect"
+            name="vscode-reh-web-${{ matrix.platform }}-${{ matrix.vscode_arch }}"
+            src="$( (find . .. -maxdepth 6 -type d \( -name "$name" -o -name "${name}-min" \) -print -quit) || true )"
+          fi
+          [ -n "${src:-}" ] && [ -d "$src" ] || { echo "FATAL: web out dir not found"; find . .. -maxdepth 6 -type d -name "vscode-reh-web-*"; exit 1; }
+          echo "Using src=$src"
+          ls -la "$src" || true
+
+          tmpdir="$(mktemp -d)"
+          dest="$tmpdir/${{ matrix.artifact }}"
+          mkdir -p "$dest"
+          tar -C "$src" -cf - . | tar -C "$dest" -xpf -
+
+          mkdir -p "$dest/static" "$dest/extensions" "$dest/static/extensions" "$dest/static/node_modules"
+          rsync -a "$dest/out/" "$dest/static/out/"
+
+          copy_first() { sub="$1"; shift; for s in "$@"; do if [ -d "$s" ]; then mkdir -p "$dest/$sub"; rsync -a "$s/" "$dest/$sub/"; return 0; fi; done; return 0; }
+
+          copy_vsda() {
+            for p in \
+              "$dest/node_modules/vsda/rust/web" \
+              "$src/static/node_modules/vsda/rust/web" \
+              "$src/node_modules/vsda/rust/web" \
+              "remote/node_modules/vsda/rust/web" \
+              "node_modules/vsda/rust/web" \
+              "$dest/node_modules/@vscode/vsda/rust/web" \
+              "$src/static/node_modules/@vscode/vsda/rust/web" \
+              "$src/node_modules/@vscode/vsda/rust/web" \
+              "remote/node_modules/@vscode/vsda/rust/web" \
+              "node_modules/@vscode/vsda/rust/web"
+            do
+              if [ -d "$p" ]; then
+                mkdir -p "$dest/static/node_modules/vsda/rust/web" "$dest/static/node_modules/@vscode/vsda/rust/web"
+                rsync -a "$p/" "$dest/static/node_modules/vsda/rust/web/" || true
+                rsync -a "$p/" "$dest/static/node_modules/@vscode/vsda/rust/web/" || true
+                return 0
+              fi
+            done
+            echo "WARN: no vsda directory found in candidates (ok for some builds)"
+            return 0
+          }
+          copy_vsda
+
+          copy_first "static/node_modules/vscode-oniguruma/release" \
+            "$dest/node_modules/vscode-oniguruma/release" \
+            "$src/static/node_modules/vscode-oniguruma/release" \
+            "$src/node_modules/vscode-oniguruma/release" \
+            "remote/node_modules/vscode-oniguruma/release" \
+            "node_modules/vscode-oniguruma/release"
+
+          copy_first "static/node_modules/vscode-textmate/release" \
+            "$dest/node_modules/vscode-textmate/release" \
+            "$src/static/node_modules/vscode-textmate/release" \
+            "$src/node_modules/vscode-textmate/release" \
+            "remote/node_modules/vscode-textmate/release" \
+            "node_modules/vscode-textmate/release"
+
+          copy_first "static/node_modules/@vscode/tree-sitter-wasm/wasm" \
+            "$dest/node_modules/@vscode/tree-sitter-wasm/wasm" \
+            "$src/static/node_modules/@vscode/tree-sitter-wasm/wasm" \
+            "$src/node_modules/@vscode/tree-sitter-wasm/wasm" \
+            "remote/node_modules/@vscode/tree-sitter-wasm/wasm" \
+            "node_modules/@vscode/tree-sitter-wasm/wasm"
+
+          if [ -d ".build/builtInExtensions" ]; then
+            rsync -a --delete ".build/builtInExtensions/" "$dest/extensions/"
+            rsync -a --delete ".build/builtInExtensions/" "$dest/static/extensions/"
+          fi
+
+          ensure_ext() {
+            name="$1"
+            for cand in ".build/builtInExtensions/$name" "$src/extensions/$name" "vscode/extensions/$name" "remote/vscode/extensions/$name"; do
+              if [ -d "$cand" ]; then
+                mkdir -p "$dest/extensions/$name" "$dest/static/extensions/$name"
+                rsync -a "$cand/" "$dest/extensions/$name/"
+                rsync -a "$cand/" "$dest/static/extensions/$name/"
+                return 0
+              fi
+            done
+            return 0
+          }
+          ensure_ext theme-seti
+          ensure_ext theme-defaults
+
+          if [ -f "$dest/product.json" ]; then
+            node -e "const fs=require('fs');const p=process.argv[1];const sha=process.argv[2];const j=JSON.parse(fs.readFileSync(p,'utf8')); j.commit=sha; fs.writeFileSync(p,JSON.stringify(j,null,2));" "$dest/product.json" "${{ github.sha }}"
+          fi
+
+          test -f "$dest/static/out/vs/workbench/api/worker/extensionHostWorkerMain.js" || { echo "MISS: extensionHostWorkerMain.js"; find "$dest" -maxdepth 10 -name extensionHostWorkerMain.js; exit 2; }
+          test -f "$dest/static/extensions/theme-defaults/themes/light_modern.json"      || { echo "MISS: theme-defaults theme json"; find "$dest" -maxdepth 12 -path "*/extensions/*theme-defaults*"; exit 2; }
+
+          if [ ! -f "$dest/static/node_modules/vsda/rust/web/vsda_bg.wasm" ] && \
+             [ ! -f "$dest/static/node_modules/@vscode/vsda/rust/web/vsda_bg.wasm" ]; then
+            echo "WARN: vsda_bg.wasm not found (ok if vsda disabled)"
+          fi
+
+          chmod +x "$dest/bin/openvscode-server" || true
+          chmod +x "$dest/bin/remote-cli/openvscode-server" || true
+          tar -czf "${{ matrix.artifact }}.${{ matrix.archive }}" -C "$tmpdir" "${{ matrix.artifact }}"
+          echo "archive=${{ matrix.artifact }}.${{ matrix.archive }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ steps.pack_web.outputs.archive }}
