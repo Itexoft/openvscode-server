@@ -394,17 +394,17 @@ class RemoteExtensionHostAgentServer extends Disposable implements IServerAPI {
 		if (msg.desiredConnectionType === ConnectionType.Management) {
 			// This should become a management connection
 
-			if (isReconnection) {
+			let treatAsReconnection = isReconnection;
+
+			if (treatAsReconnection && !this._managementConnections[reconnectionToken]) {
+				const seenBefore = this._allReconnectionTokens.has(reconnectionToken);
+				const reason = seenBefore ? 'Stale reconnection token encountered. Treating as new connection.' : 'Unknown reconnection token. Assuming server restart and treating as new connection.';
+				this._logService.info(`${logPrefix} ${reason}`);
+				treatAsReconnection = false;
+			}
+
+			if (treatAsReconnection) {
 				// This is a reconnection
-				if (!this._managementConnections[reconnectionToken]) {
-					if (!this._allReconnectionTokens.has(reconnectionToken)) {
-						// This is an unknown reconnection token
-						return this._rejectWebSocketConnection(logPrefix, protocol, `Unknown reconnection token (never seen)`);
-					} else {
-						// This is a connection that was seen in the past, but is no longer valid
-						return this._rejectWebSocketConnection(logPrefix, protocol, `Unknown reconnection token (seen before)`);
-					}
-				}
 
 				protocol.sendControl(VSBuffer.fromString(JSON.stringify({ type: 'ok' })));
 				const dataChunk = protocol.readEntireBuffer();
@@ -441,17 +441,17 @@ class RemoteExtensionHostAgentServer extends Disposable implements IServerAPI {
 			this._logService.trace(`${logPrefix} - startParams language: ${startParams.language}`);
 			this._logService.trace(`${logPrefix} - startParams env: ${JSON.stringify(startParams.env)}`);
 
-			if (isReconnection) {
+			let treatAsReconnection = isReconnection;
+
+			if (treatAsReconnection && !this._extHostConnections[reconnectionToken]) {
+				const seenBefore = this._allReconnectionTokens.has(reconnectionToken);
+				const reason = seenBefore ? 'Stale reconnection token encountered. Treating as new connection.' : 'Unknown reconnection token. Assuming server restart and treating as new connection.';
+				this._logService.info(`${logPrefix} ${reason}`);
+				treatAsReconnection = false;
+			}
+
+			if (treatAsReconnection) {
 				// This is a reconnection
-				if (!this._extHostConnections[reconnectionToken]) {
-					if (!this._allReconnectionTokens.has(reconnectionToken)) {
-						// This is an unknown reconnection token
-						return this._rejectWebSocketConnection(logPrefix, protocol, `Unknown reconnection token (never seen)`);
-					} else {
-						// This is a connection that was seen in the past, but is no longer valid
-						return this._rejectWebSocketConnection(logPrefix, protocol, `Unknown reconnection token (seen before)`);
-					}
-				}
 
 				protocol.sendPause();
 				protocol.sendControl(VSBuffer.fromString(JSON.stringify(startParams.port ? { debugPort: startParams.port } : {})));

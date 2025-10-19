@@ -114,6 +114,8 @@ export class ExtHostLanguageModels implements ExtHostLanguageModelsShape {
 	private readonly _onDidChangeModelAccess = new Emitter<{ from: ExtensionIdentifier; to: ExtensionIdentifier }>();
 	private readonly _onDidChangeProviders = new Emitter<void>();
 	readonly onDidChangeProviders = this._onDidChangeProviders.event;
+	private readonly _onDidChangeModelProxyAvailability = new Emitter<void>();
+	readonly onDidChangeModelProxyAvailability = this._onDidChangeModelProxyAvailability.event;
 
 	private readonly _languageModelProviders = new Map<string, LanguageModelProviderData>();
 	// TODO @lramos15 - Remove the need for both info and metadata as it's a lot of redundancy. Should just need one
@@ -121,6 +123,7 @@ export class ExtHostLanguageModels implements ExtHostLanguageModelsShape {
 	private readonly _modelAccessList = new ExtensionIdentifierMap<ExtensionIdentifierSet>();
 	private readonly _pendingRequest = new Map<number, { languageModelId: string; res: LanguageModelResponse }>();
 	private readonly _ignoredFileProviders = new Map<number, vscode.LanguageModelIgnoredFileProvider>();
+	private _languageModelProxyProvider: vscode.LanguageModelProxyProvider | undefined;
 
 	constructor(
 		@IExtHostRpcService extHostRpc: IExtHostRpcService,
@@ -133,6 +136,7 @@ export class ExtHostLanguageModels implements ExtHostLanguageModelsShape {
 	dispose(): void {
 		this._onDidChangeModelAccess.dispose();
 		this._onDidChangeProviders.dispose();
+		this._onDidChangeModelProxyAvailability.dispose();
 	}
 
 	registerLanguageModelChatProvider(extension: IExtensionDescription, vendor: string, provider: vscode.LanguageModelChatProvider): IDisposable {
@@ -597,6 +601,49 @@ export class ExtHostLanguageModels implements ExtHostLanguageModelsShape {
 		checkProposedApiEnabled(extension, 'chatParticipantAdditions');
 
 		return this._proxy.$fileIsIgnored(uri, token);
+	}
+
+	get isModelProxyAvailable(): boolean {
+		return !!this._languageModelProxyProvider;
+	}
+
+	async getModelProxy(extension: IExtensionDescription): Promise<vscode.LanguageModelProxy> {
+		checkProposedApiEnabled(extension, 'languageModelProxy');
+
+		if (!this._languageModelProxyProvider) {
+			this._logService.trace('[LanguageModelProxy] No LanguageModelProxyProvider registered');
+			throw new Error('No language model proxy provider is registered.');
+		}
+
+		const requestingExtensionId = ExtensionIdentifier.toKey(extension.identifier);
+		try {
+			if (!this._languageModelProxyProvider.provideModelProxy) {
+				this._logService.warn('[LanguageModelProxy] Provider does not implement provideModelProxy');
+				throw new Error('Language model proxy is not available.');
+			}
+			const result = await Promise.resolve(this._languageModelProxyProvider.provideModelProxy.call(this._languageModelProxyProvider, requestingExtensionId, CancellationToken.None));
+			if (!result) {
+				this._logService.warn(`[LanguageModelProxy] Provider returned no proxy for ${requestingExtensionId}`);
+				throw new Error('Language model proxy is not available.');
+			}
+			return result;
+		} catch (err) {
+			this._logService.error(`[LanguageModelProxy] Provider failed to return proxy for ${requestingExtensionId}`, err);
+			throw err;
+		}
+	}
+
+	registerLanguageModelProxyProvider(extension: IExtensionDescription, provider: vscode.LanguageModelProxyProvider): vscode.Disposable {
+		checkProposedApiEnabled(extension, 'chatParticipantPrivate');
+
+		this._languageModelProxyProvider = provider;
+		this._onDidChangeModelProxyAvailability.fire();
+		return toDisposable(() => {
+			if (this._languageModelProxyProvider === provider) {
+				this._languageModelProxyProvider = undefined;
+				this._onDidChangeModelProxyAvailability.fire();
+			}
+		});
 	}
 
 	async $isFileIgnored(handle: number, uri: UriComponents, token: CancellationToken): Promise<boolean> {

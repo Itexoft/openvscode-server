@@ -61,15 +61,61 @@ jobs:
 
       - run: npm run server:init
 
+      - name: build web extensions
+        run: |
+          npm run gulp compile-web
+          npm run gulp extensions-ci
+          npm run gulp compile-web-extensions-build
+
+      - name: sync web extension outputs
+        run: node -e "const fs=require('fs');const path=require('path');const src=path.resolve('.build/web/extensions');const dest=path.resolve('.build/extensions');if(fs.existsSync(src)){fs.mkdirSync(path.dirname(dest),{recursive:true});fs.cpSync(src,dest,{recursive:true,force:true});}"
+
+      - name: build web server bundle
+        run: |
+          node - "${{ matrix.platform }}" "${{ matrix.vscode_arch }}" <<'NODE'
+          const { spawnSync } = require('child_process');
+          const platform = process.argv[2];
+          const arch = process.argv[3];
+          const tasks = [
+            `vscode-reh-web-${platform}-${arch}-min-ci`,
+            `vscode-reh-web-${platform}-${arch}-min`,
+          ];
+          const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+          let exitCode = 1;
+          for (const task of tasks) {
+            const result = spawnSync(npmCmd, ['run', 'gulp', '--', task], { stdio: 'inherit' });
+            exitCode = typeof result.status === 'number' ? result.status : 1;
+            if (exitCode === 0) {
+              break;
+            }
+          }
+          process.exit(exitCode);
+          NODE
+        shell: bash
+
       - if: matrix.platform != 'win32'
         run: |
           npm run gulp vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}-min
+          if [ -d ".build/web/extensions" ] && [ -d "../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}" ]; then
+            mkdir -p ../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}/extensions ../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}/static/extensions
+            rsync -a ./.build/web/extensions/ ../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}/extensions/ || true
+            rsync -a ./.build/web/extensions/ ../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}/static/extensions/ || true
+          fi
           mv ../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }} ../vscode-server-${{ matrix.platform }}-${{ matrix.vscode_arch }}
           tar -czf ${{ matrix.artifact }}.${{ matrix.archive }} -C .. vscode-server-${{ matrix.platform }}-${{ matrix.vscode_arch }}
 
       - if: matrix.platform == 'win32'
         run: |
           npm run gulp vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}-min
+          if (Test-Path ".build/web/extensions") {
+            $target = "..\vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}"
+            if (Test-Path $target) {
+              New-Item -ItemType Directory -Force -Path "$target\extensions" | Out-Null
+              New-Item -ItemType Directory -Force -Path "$target\static\extensions" | Out-Null
+              Copy-Item ".build/web/extensions/*" "$target\extensions" -Recurse -Force -ErrorAction SilentlyContinue
+              Copy-Item ".build/web/extensions/*" "$target\static\extensions" -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
           Move-Item ..\\vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }} ..\\vscode-server-${{ matrix.platform }}-${{ matrix.vscode_arch }}
           Compress-Archive -Path ..\\vscode-server-${{ matrix.platform }}-${{ matrix.vscode_arch }} -DestinationPath ${{ matrix.artifact }}.${{ matrix.archive }}
         shell: pwsh

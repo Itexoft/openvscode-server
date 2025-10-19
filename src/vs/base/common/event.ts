@@ -999,6 +999,7 @@ export class Emitter<T> {
 	private readonly _perfMon?: EventProfiling;
 	private _disposed?: true;
 	private _event?: Event<T>;
+	private _warnOnUnknownListenerEmitted?: boolean;
 
 	/**
 	 * A listener, or list of listeners. A single listener is the most common
@@ -1160,10 +1161,11 @@ export class Emitter<T> {
 
 		const index = listeners.indexOf(listener);
 		if (index === -1) {
-			console.log('disposed?', this._disposed);
-			console.log('size?', this._size);
-			console.log('arr?', JSON.stringify(this._listeners));
-			throw new Error('Attempted to dispose unknown listener');
+			if (!this._warnOnUnknownListenerEmitted) {
+				this._warnOnUnknownListenerEmitted = true;
+				console.warn(`Attempted to dispose unknown listener (disposed=${Boolean(this._disposed)}, size=${this._size})`);
+			}
+			return;
 		}
 
 		this._size--;

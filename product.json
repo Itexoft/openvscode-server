@@ -1165,5 +1165,8 @@
 	},
 	"linkProtectionTrustedDomains": [
 		"https://open-vsx.org"
+	],
+	"extensionAllowedProposedApi": [
+		"openai.chatgpt"
 	]
 }

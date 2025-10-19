@@ -1539,6 +1539,22 @@ export function createApiFactoryAndRegisterActors(accessor: ServicesAccessor): I
 			registerLanguageModelChatProvider: (vendor, provider) => {
 				return extHostLanguageModels.registerLanguageModelChatProvider(extension, vendor, provider);
 			},
+			get isModelProxyAvailable() {
+				checkProposedApiEnabled(extension, 'languageModelProxy');
+				return extHostLanguageModels.isModelProxyAvailable;
+			},
+			onDidChangeModelProxyAvailability: (listener, thisArgs?, disposables?) => {
+				checkProposedApiEnabled(extension, 'languageModelProxy');
+				return extHostLanguageModels.onDidChangeModelProxyAvailability(listener, thisArgs, disposables);
+			},
+			getModelProxy: () => {
+				checkProposedApiEnabled(extension, 'languageModelProxy');
+				return extHostLanguageModels.getModelProxy(extension);
+			},
+			registerLanguageModelProxyProvider: (provider: vscode.LanguageModelProxyProvider) => {
+				checkProposedApiEnabled(extension, 'chatParticipantPrivate');
+				return extHostLanguageModels.registerLanguageModelProxyProvider(extension, provider);
+			},
 			// --- embeddings
 			get embeddingModels() {
 				checkProposedApiEnabled(extension, 'embeddings');

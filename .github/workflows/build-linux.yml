@@ -53,10 +53,18 @@ jobs:
           set -euxo pipefail
           npm run server:init
           npm run gulp compile-build-without-mangling
+          npm run gulp compile-web
           npm run gulp extensions-ci
+          npm run gulp compile-web-extensions-build
+          node -e "const fs=require('fs');const path=require('path');const src=path.resolve('.build/web/extensions');const dest=path.resolve('.build/extensions');if(fs.existsSync(src)){fs.mkdirSync(path.dirname(dest),{recursive:true});fs.cpSync(src,dest,{recursive:true,force:true});}"
           npm run gulp minify-vscode-reh
           npm run gulp minify-vscode-reh-web
           npm run gulp vscode-web-min-ci || npm run gulp vscode-web-min
+
+      - name: build web server bundle
+        run: |
+          set -euxo pipefail
+          npm run gulp vscode-reh-web-${{ matrix.platform }}-${{ matrix.vscode_arch }}-min-ci || npm run gulp vscode-reh-web-${{ matrix.platform }}-${{ matrix.vscode_arch }}-min
 
       - name: locate web out dir
         id: find_out_web
@@ -163,8 +171,9 @@ jobs:
             "node_modules/@vscode/tree-sitter-wasm/wasm"
 
           if [ -d ".build/builtInExtensions" ]; then
-            rsync -a --delete ".build/builtInExtensions/" "$dest/extensions/"
-            rsync -a --delete ".build/builtInExtensions/" "$dest/static/extensions/"
+            # Keep local extension outputs intact while layering marketplace downloads
+            rsync -a ".build/builtInExtensions/" "$dest/extensions/"
+            rsync -a ".build/builtInExtensions/" "$dest/static/extensions/"
           fi
 
           ensure_ext() {
@@ -183,53 +192,65 @@ jobs:
           ensure_ext theme-defaults
 
           if [ -f "$dest/product.json" ]; then
-            commit="$(node - <<'NODE' "$dest"
-const fs = require('fs');
-const path = require('path');
-const root = process.argv[2];
-const candidates = [
-  'static/out/vs/code/browser/workbench/workbench.js',
-  'out/vs/code/browser/workbench/workbench.js',
-  'static/out/bootstrap-fork.js',
-  'out/bootstrap-fork.js'
-];
-for (const rel of candidates) {
-  const candidate = path.join(root, rel);
-  if (!fs.existsSync(candidate)) {
-    continue;
-  }
-  try {
-    const text = fs.readFileSync(candidate, 'utf8');
-    const match = text.match(/sourcemaps\/([0-9a-f]{40})\//);
-    if (match) {
-      process.stdout.write(match[1]);
-      break;
-    }
-  } catch (error) {
-    // ignore and continue
-  }
-}
-NODE
-)"
-            if [ -n "${commit:-}" ]; then
-              node - <<'NODE' "$dest/product.json" "$commit"
-const fs = require('fs');
-const productPath = process.argv[1];
-const commit = process.argv[2];
-if (!commit || !/^[0-9a-f]{40}$/i.test(commit)) {
-  process.exit(0);
-}
-const data = JSON.parse(fs.readFileSync(productPath, 'utf8'));
-if (data.commit !== commit) {
-  data.commit = commit;
-  fs.writeFileSync(productPath, JSON.stringify(data, null, 2) + '\n');
-}
-NODE
+            commit="$(ROOT_DIR="$dest" node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const root = process.env.ROOT_DIR;
+          if (!root) {
+            process.exit(0);
+          }
+          const candidates = [
+            'static/out/vs/code/browser/workbench/workbench.js',
+            'out/vs/code/browser/workbench/workbench.js',
+            'static/out/bootstrap-fork.js',
+            'out/bootstrap-fork.js'
+          ];
+          for (const rel of candidates) {
+            const candidate = path.join(root, rel);
+            if (!fs.existsSync(candidate)) {
+              continue;
+            }
+            try {
+              const text = fs.readFileSync(candidate, 'utf8');
+              const match = text.match(/sourcemaps\/([0-9a-f]{40})\//);
+              if (match) {
+                process.stdout.write(match[1]);
+                break;
+              }
+            } catch (error) {
+              // ignore and continue
+            }
+          }
+          NODE
+          )"
+          if [ -n "${commit:-}" ]; then
+          PRODUCT_PATH="$dest/product.json" PRODUCT_COMMIT="$commit" node <<'NODE'
+          const fs = require('fs');
+          const productPath = process.env.PRODUCT_PATH;
+          const commit = process.env.PRODUCT_COMMIT;
+          if (!productPath || !commit || !/^[0-9a-f]{40}$/i.test(commit)) {
+            process.exit(0);
+          }
+          try {
+            const data = JSON.parse(fs.readFileSync(productPath, 'utf8'));
+            if (data.commit !== commit) {
+              data.commit = commit;
+              fs.writeFileSync(productPath, JSON.stringify(data, null, 2) + '\n');
+            }
+          } catch (error) {
+            // ignore
+          }
+          NODE
             fi
           fi
 
           test -f "$dest/static/out/vs/workbench/api/worker/extensionHostWorkerMain.js" || { echo "MISS: extensionHostWorkerMain.js"; find "$dest" -maxdepth 10 -name extensionHostWorkerMain.js; exit 2; }
           test -f "$dest/static/extensions/theme-defaults/themes/light_modern.json"      || { echo "MISS: theme-defaults theme json"; find "$dest" -maxdepth 12 -path "*/extensions/*theme-defaults*"; exit 2; }
+          
+          if [ -d ".build/web/extensions" ]; then
+            rsync -a ".build/web/extensions/" "$dest/extensions/" || true
+            rsync -a ".build/web/extensions/" "$dest/static/extensions/" || true
+          fi
 
           if [ ! -f "$dest/static/node_modules/vsda/rust/web/vsda_bg.wasm" ] && \
              [ ! -f "$dest/static/node_modules/@vscode/vsda/rust/web/vsda_bg.wasm" ]; then
