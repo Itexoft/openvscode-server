@@ -63,6 +63,18 @@ export type ExtensionVirtualWorkspaceSupport = {
 	readonly override?: boolean;
 };
 
+export interface IProductExtensionMarketplace {
+	readonly id: string;
+	readonly displayName?: string;
+	readonly serviceUrl: string;
+	readonly controlUrl?: string;
+	readonly itemUrl?: string;
+	readonly resourceUrlTemplate?: string;
+	readonly extensionUrlTemplate?: string;
+	readonly nlsBaseUrl?: string;
+	readonly publisherUrl?: string;
+}
+
 export interface IProductConfiguration {
 	readonly version: string;
 	readonly date?: string;
@@ -111,6 +123,7 @@ export interface IProductConfiguration {
 		readonly nlsBaseUrl: string;
 		readonly accessSKUs?: string[];
 	};
+	readonly extensionsMarketplaces?: readonly IProductExtensionMarketplace[];
 
 	readonly mcpGallery?: {
 		readonly serviceUrl: string;

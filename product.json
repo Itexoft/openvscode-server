@@ -1163,6 +1163,30 @@
 		"nlsBaseUrl": "",
 		"publisherUrl": ""
 	},
+	"extensionsMarketplaces": [
+		{
+			"id": "openvsx",
+			"displayName": "Open VSX",
+			"serviceUrl": "https://open-vsx.org/vscode/gallery",
+			"itemUrl": "https://open-vsx.org/vscode/item",
+			"publisherUrl": "https://open-vsx.org/vscode/publisher",
+			"resourceUrlTemplate": "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}",
+			"extensionUrlTemplate": "https://open-vsx.org/vscode/gallery/{publisher}/{name}/latest",
+			"controlUrl": "",
+			"nlsBaseUrl": ""
+		},
+		{
+			"id": "vsm",
+			"displayName": "Visual Studio Marketplace",
+			"serviceUrl": "https://marketplace.visualstudio.com/_apis/public/gallery",
+			"itemUrl": "https://marketplace.visualstudio.com/items",
+			"publisherUrl": "https://marketplace.visualstudio.com/publishers",
+			"resourceUrlTemplate": "https://{publisher}.gallery.vsassets.io/_apis/public/gallery/publisher/{publisher}/extension/{name}/{version}/assetbyname/{path}",
+			"extensionUrlTemplate": "",
+			"controlUrl": "",
+			"nlsBaseUrl": ""
+		}
+	],
 	"linkProtectionTrustedDomains": [
 		"https://open-vsx.org"
 	],

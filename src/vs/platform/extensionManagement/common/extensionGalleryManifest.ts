@@ -65,6 +65,22 @@ export interface IExtensionGalleryManifest {
 	};
 }
 
+export interface IExtensionGalleryMarketplace extends IExtensionGalleryManifest {
+	readonly marketplaceId: string;
+	readonly displayName?: string;
+	readonly serviceUrl: string;
+	readonly itemUrl?: string;
+	readonly publisherUrl?: string;
+	readonly resourceUrlTemplate?: string;
+	readonly extensionUrlTemplate?: string;
+	readonly controlUrl?: string;
+	readonly nlsBaseUrl?: string;
+}
+
+export interface IExtensionGalleryCompositeManifest {
+	readonly marketplaces: readonly IExtensionGalleryMarketplace[];
+}
+
 export const enum ExtensionGalleryManifestStatus {
 	Available = 'available',
 	RequiresSignIn = 'requiresSignIn',
@@ -79,8 +95,8 @@ export interface IExtensionGalleryManifestService {
 
 	readonly extensionGalleryManifestStatus: ExtensionGalleryManifestStatus;
 	readonly onDidChangeExtensionGalleryManifestStatus: Event<ExtensionGalleryManifestStatus>;
-	readonly onDidChangeExtensionGalleryManifest: Event<IExtensionGalleryManifest | null>;
-	getExtensionGalleryManifest(): Promise<IExtensionGalleryManifest | null>;
+	readonly onDidChangeExtensionGalleryManifest: Event<IExtensionGalleryCompositeManifest | null>;
+	getExtensionGalleryManifest(): Promise<IExtensionGalleryCompositeManifest | null>;
 }
 
 export function getExtensionGalleryManifestResourceUri(manifest: IExtensionGalleryManifest, type: string): string | undefined {
@@ -96,6 +112,19 @@ export function getExtensionGalleryManifestResourceUri(manifest: IExtensionGalle
 		break;
 	}
 	return undefined;
+}
+
+export function getExtensionGalleryMarketplaces(manifest: IExtensionGalleryCompositeManifest | null): readonly IExtensionGalleryMarketplace[] {
+	return manifest?.marketplaces ?? [];
+}
+
+export function getPrimaryExtensionGalleryMarketplace(manifest: IExtensionGalleryCompositeManifest | null): IExtensionGalleryMarketplace | undefined {
+	const marketplaces = getExtensionGalleryMarketplaces(manifest);
+	return marketplaces.length ? marketplaces[0] : undefined;
+}
+
+export function findExtensionGalleryMarketplace(manifest: IExtensionGalleryCompositeManifest | null, marketplaceId: string): IExtensionGalleryMarketplace | undefined {
+	return getExtensionGalleryMarketplaces(manifest).find(marketplace => marketplace.marketplaceId === marketplaceId);
 }
 
 export const ExtensionGalleryServiceUrlConfigKey = 'extensions.gallery.serviceUrl';

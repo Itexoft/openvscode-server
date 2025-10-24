@@ -30,7 +30,7 @@ import { ITelemetryService } from '../../telemetry/common/telemetry.js';
 import { StopWatch } from '../../../base/common/stopwatch.js';
 import { format2 } from '../../../base/common/strings.js';
 import { IAssignmentService } from '../../assignment/common/assignment.js';
-import { ExtensionGalleryResourceType, Flag, getExtensionGalleryManifestResourceUri, IExtensionGalleryManifest, IExtensionGalleryManifestService, ExtensionGalleryManifestStatus } from './extensionGalleryManifest.js';
+import { ExtensionGalleryResourceType, Flag, getExtensionGalleryManifestResourceUri, getExtensionGalleryMarketplaces, getPrimaryExtensionGalleryMarketplace, IExtensionGalleryManifestService, IExtensionGalleryMarketplace, ExtensionGalleryManifestStatus } from './extensionGalleryManifest.js';
 import { TelemetryTrustedValue } from '../../telemetry/common/telemetryUtils.js';
 
 const CURRENT_TARGET_PLATFORM = isWeb ? TargetPlatform.WEB : getTargetPlatform(platform, arch);
@@ -455,7 +455,7 @@ function setTelemetry(extension: IGalleryExtension, index: number, querySource?:
 	extension.telemetryData = { index, querySource, queryActivityId: extension.queryContext?.[SEARCH_ACTIVITY_HEADER_NAME] };
 }
 
-function toExtension(galleryExtension: IRawGalleryExtension, version: IRawGalleryExtensionVersion, allTargetPlatforms: TargetPlatform[], extensionGalleryManifest: IExtensionGalleryManifest, productService: IProductService, queryContext?: IStringDictionary<any>): IGalleryExtension {
+function toExtension(galleryExtension: IRawGalleryExtension, version: IRawGalleryExtensionVersion, allTargetPlatforms: TargetPlatform[], extensionGalleryManifest: IExtensionGalleryMarketplace, productService: IProductService, queryContext?: IStringDictionary<any>): IGalleryExtension {
 	const latestVersion = galleryExtension.versions[0];
 	const assets: IGalleryExtensionAssets = {
 		manifest: getVersionAsset(version, AssetType.Manifest),
@@ -566,8 +566,9 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 		@IAllowedExtensionsService private readonly allowedExtensionsService: IAllowedExtensionsService,
 		@IExtensionGalleryManifestService private readonly extensionGalleryManifestService: IExtensionGalleryManifestService,
 	) {
-		this.extensionsControlUrl = productService.extensionsGallery?.controlUrl;
-		this.unpkgResourceApi = productService.extensionsGallery?.extensionUrlTemplate;
+		const primaryMarketplace = productService.extensionsMarketplaces?.[0];
+		this.extensionsControlUrl = primaryMarketplace?.controlUrl ?? productService.extensionsGallery?.controlUrl;
+		this.unpkgResourceApi = primaryMarketplace?.extensionUrlTemplate ?? productService.extensionsGallery?.extensionUrlTemplate;
 		this.extensionsEnabledWithApiProposalVersion = productService.extensionsEnabledWithApiProposalVersion?.map(id => id.toLowerCase()) ?? [];
 		this.commonHeadersPromise = resolveMarketplaceHeaders(
 			productService.version,
@@ -586,29 +587,28 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 	getExtensions(extensionInfos: ReadonlyArray<IExtensionInfo>, token: CancellationToken): Promise<IGalleryExtension[]>;
 	getExtensions(extensionInfos: ReadonlyArray<IExtensionInfo>, options: IExtensionQueryOptions, token: CancellationToken): Promise<IGalleryExtension[]>;
 	async getExtensions(extensionInfos: ReadonlyArray<IExtensionInfo>, arg1: any, arg2?: any): Promise<IGalleryExtension[]> {
-		const extensionGalleryManifest = await this.extensionGalleryManifestService.getExtensionGalleryManifest();
-		if (!extensionGalleryManifest) {
+		const compositeManifest = await this.extensionGalleryManifestService.getExtensionGalleryManifest();
+		if (!compositeManifest) {
 			throw new Error('No extension gallery service configured.');
+		}
+		const marketplaces = getExtensionGalleryMarketplaces(compositeManifest);
+		if (!marketplaces.length) {
+			throw new Error('No extension gallery marketplace configured.');
 		}
 
 		const options = CancellationToken.isCancellationToken(arg1) ? {} : arg1 as IExtensionQueryOptions;
 		const token = CancellationToken.isCancellationToken(arg1) ? arg1 : arg2 as CancellationToken;
 
-		const resourceApi = await this.getResourceApi(extensionGalleryManifest);
-		const result = resourceApi
-			? await this.getExtensionsUsingResourceApi(extensionInfos, options, resourceApi, extensionGalleryManifest, token)
-			: await this.getExtensionsUsingQueryApi(extensionInfos, options, extensionGalleryManifest, token);
+		const resolvedByIndex = await this.resolveExtensionsAcrossMarketplaces(extensionInfos, options, marketplaces, token);
 
-		const uuids = result.map(r => r.identifier.uuid);
-		const extensionInfosByName: IExtensionInfo[] = [];
-		for (const e of extensionInfos) {
-			if (e.uuid && !uuids.includes(e.uuid)) {
-				extensionInfosByName.push({ ...e, uuid: undefined });
+		const unresolvedWithUuid: { index: number; info: IExtensionInfo }[] = [];
+		for (let index = 0; index < extensionInfos.length; index++) {
+			if (extensionInfos[index].uuid && !resolvedByIndex[index]) {
+				unresolvedWithUuid.push({ index, info: { ...extensionInfos[index], uuid: undefined } });
 			}
 		}
 
-		if (extensionInfosByName.length) {
-			// report telemetry data for additional query
+		if (unresolvedWithUuid.length) {
 			this.telemetryService.publicLog2<
 				{ count: number },
 				{
@@ -616,28 +616,104 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 					comment: 'Report the query to the Marketplace for fetching extensions by name';
 					readonly count: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; comment: 'Number of extensions to fetch' };
 				}>('galleryService:additionalQueryByName', {
-					count: extensionInfosByName.length
+					count: unresolvedWithUuid.length
 				});
 
-			const extensions = await this.getExtensionsUsingQueryApi(extensionInfosByName, options, extensionGalleryManifest, token);
-			result.push(...extensions);
+			const infosByName = unresolvedWithUuid.map(entry => entry.info);
+			const resolvedByName = await this.resolveExtensionsAcrossMarketplaces(infosByName, options, marketplaces, token);
+			for (let i = 0; i < resolvedByName.length; i++) {
+				const extension = resolvedByName[i];
+				if (!extension) {
+					continue;
+				}
+				const originalIndex = unresolvedWithUuid[i].index;
+				resolvedByIndex[originalIndex] = extension;
+			}
+		}
+
+		const result: IGalleryExtension[] = [];
+		for (const extension of resolvedByIndex) {
+			if (extension) {
+				result.push(extension);
+			}
 		}
 
 		return result;
 	}
 
-	private async getResourceApi(extensionGalleryManifest: IExtensionGalleryManifest): Promise<{ uri: string; fallback?: string } | undefined> {
-		const latestVersionResource = getExtensionGalleryManifestResourceUri(extensionGalleryManifest, ExtensionGalleryResourceType.ExtensionLatestVersionUri);
+	private async resolveExtensionsAcrossMarketplaces(extensionInfos: ReadonlyArray<IExtensionInfo>, options: IExtensionQueryOptions, marketplaces: readonly IExtensionGalleryMarketplace[], token: CancellationToken): Promise<(IGalleryExtension | undefined)[]> {
+		const resolvedByIndex: (IGalleryExtension | undefined)[] = new Array(extensionInfos.length);
+		const unresolvedIndices = new Set<number>();
+		for (let index = 0; index < extensionInfos.length; index++) {
+			unresolvedIndices.add(index);
+		}
+
+		for (const marketplace of marketplaces) {
+			if (!unresolvedIndices.size) {
+				break;
+			}
+
+			const subsetInfos = Array.from(unresolvedIndices).map(index => extensionInfos[index]);
+			if (!subsetInfos.length) {
+				continue;
+			}
+
+			const marketplaceResults = await this.resolveExtensionsForMarketplace(subsetInfos, options, marketplace, token);
+			for (const extension of marketplaceResults) {
+				const matchedIndex = this.findMatchingExtensionIndex(extension, unresolvedIndices, extensionInfos);
+				if (matchedIndex === undefined) {
+					continue;
+				}
+				resolvedByIndex[matchedIndex] = extension;
+				unresolvedIndices.delete(matchedIndex);
+			}
+		}
+
+		return resolvedByIndex;
+	}
+
+	private async resolveExtensionsForMarketplace(extensionInfos: ReadonlyArray<IExtensionInfo>, options: IExtensionQueryOptions, marketplace: IExtensionGalleryMarketplace, token: CancellationToken): Promise<IGalleryExtension[]> {
+		const resourceApi = await this.getResourceApi(marketplace);
+		if (resourceApi) {
+			return this.getExtensionsUsingResourceApi(extensionInfos, options, resourceApi, marketplace, token);
+		}
+		return this.getExtensionsUsingQueryApi(extensionInfos, options, marketplace, token);
+	}
+
+	private findMatchingExtensionIndex(extension: IGalleryExtension, unresolved: Set<number>, extensionInfos: ReadonlyArray<IExtensionInfo>): number | undefined {
+		if (!unresolved.size) {
+			return undefined;
+		}
+
+		for (const index of unresolved) {
+			const info = extensionInfos[index];
+			if (info.uuid && extension.identifier.uuid && info.uuid === extension.identifier.uuid) {
+				return index;
+			}
+		}
+
+		for (const index of unresolved) {
+			const info = extensionInfos[index];
+			if (areSameExtensions({ id: info.id, uuid: info.uuid }, extension.identifier)) {
+				return index;
+			}
+		}
+
+		return undefined;
+	}
+
+	private async getResourceApi(marketplace: IExtensionGalleryMarketplace): Promise<{ uri: string; fallback?: string } | undefined> {
+		const latestVersionResource = getExtensionGalleryManifestResourceUri(marketplace, ExtensionGalleryResourceType.ExtensionLatestVersionUri);
 		if (latestVersionResource) {
 			return {
 				uri: latestVersionResource,
-				fallback: this.unpkgResourceApi
+				fallback: marketplace.extensionUrlTemplate ?? this.unpkgResourceApi
 			};
 		}
 		return undefined;
 	}
 
-	private async getExtensionsUsingQueryApi(extensionInfos: ReadonlyArray<IExtensionInfo>, options: IExtensionQueryOptions, extensionGalleryManifest: IExtensionGalleryManifest, token: CancellationToken): Promise<IGalleryExtension[]> {
+	private async getExtensionsUsingQueryApi(extensionInfos: ReadonlyArray<IExtensionInfo>, options: IExtensionQueryOptions, marketplace: IExtensionGalleryMarketplace, token: CancellationToken): Promise<IGalleryExtension[]> {
 		const names: string[] = [],
 			ids: string[] = [],
 			includePreRelease: (IExtensionIdentifier & { includePreRelease: boolean })[] = [],
@@ -686,7 +762,7 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 				productVersion: options.productVersion ?? { version: this.productService.version, date: this.productService.date },
 				isQueryForReleaseVersionFromPreReleaseVersion
 			},
-			extensionGalleryManifest,
+			marketplace,
 			token);
 
 		if (options.source) {
@@ -696,7 +772,7 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 		return extensions;
 	}
 
-	private async getExtensionsUsingResourceApi(extensionInfos: ReadonlyArray<IExtensionInfo>, options: IExtensionQueryOptions, resourceApi: { uri: string; fallback?: string }, extensionGalleryManifest: IExtensionGalleryManifest, token: CancellationToken): Promise<IGalleryExtension[]> {
+	private async getExtensionsUsingResourceApi(extensionInfos: ReadonlyArray<IExtensionInfo>, options: IExtensionQueryOptions, resourceApi: { uri: string; fallback?: string }, marketplace: IExtensionGalleryMarketplace, token: CancellationToken): Promise<IGalleryExtension[]> {
 
 		const result: IGalleryExtension[] = [];
 		const toQuery: IExtensionInfo[] = [];
@@ -716,7 +792,7 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 		await Promise.all(toFetchLatest.map(async extensionInfo => {
 			let galleryExtension: IGalleryExtension | null | 'NOT_FOUND';
 			try {
-				galleryExtension = await this.getLatestGalleryExtension(extensionInfo, options, resourceApi, extensionGalleryManifest, token);
+				galleryExtension = await this.getLatestGalleryExtension(extensionInfo, options, resourceApi, marketplace, token);
 				if (galleryExtension === 'NOT_FOUND') {
 					if (extensionInfo.uuid) {
 						// Fallback to query if extension with UUID is not found. Probably extension is renamed.
@@ -765,14 +841,14 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 		}));
 
 		if (toQuery.length) {
-			const extensions = await this.getExtensionsUsingQueryApi(toQuery, options, extensionGalleryManifest, token);
+			const extensions = await this.getExtensionsUsingQueryApi(toQuery, options, marketplace, token);
 			result.push(...extensions);
 		}
 
 		return result;
 	}
 
-	private async getLatestGalleryExtension(extensionInfo: IExtensionInfo, options: IExtensionQueryOptions, resourceApi: { uri: string; fallback?: string }, extensionGalleryManifest: IExtensionGalleryManifest, token: CancellationToken): Promise<IGalleryExtension | null | 'NOT_FOUND'> {
+	private async getLatestGalleryExtension(extensionInfo: IExtensionInfo, options: IExtensionQueryOptions, resourceApi: { uri: string; fallback?: string }, marketplace: IExtensionGalleryMarketplace, token: CancellationToken): Promise<IGalleryExtension | null | 'NOT_FOUND'> {
 		const rawGalleryExtension = await this.getLatestRawGalleryExtensionWithFallback(extensionInfo, resourceApi, token);
 
 		if (!rawGalleryExtension) {
@@ -793,7 +869,7 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 			}, allTargetPlatforms);
 
 		if (rawGalleryExtensionVersion) {
-			return toExtension(rawGalleryExtension, rawGalleryExtensionVersion, allTargetPlatforms, extensionGalleryManifest, this.productService);
+			return toExtension(rawGalleryExtension, rawGalleryExtensionVersion, allTargetPlatforms, marketplace, this.productService);
 		}
 
 		return null;
@@ -945,11 +1021,18 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 	}
 
 	async query(options: IQueryOptions, token: CancellationToken): Promise<IPager<IGalleryExtension>> {
-		const extensionGalleryManifest = await this.extensionGalleryManifestService.getExtensionGalleryManifest();
+		const compositeManifest = await this.extensionGalleryManifestService.getExtensionGalleryManifest();
 
-		if (!extensionGalleryManifest) {
+		if (!compositeManifest) {
 			throw new Error('No extension gallery service configured.');
 		}
+
+		const marketplaces = getExtensionGalleryMarketplaces(compositeManifest);
+		if (!marketplaces.length) {
+			throw new Error('No extension gallery marketplace configured.');
+		}
+
+		const primaryMarketplace = marketplaces[0];
 
 		let text = options.text || '';
 		const pageSize = options.pageSize ?? 50;
@@ -958,19 +1041,16 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 			.withPage(1, pageSize);
 
 		if (text) {
-			// Use category filter instead of "category:themes"
 			text = text.replace(/\bcategory:("([^"]*)"|([^"]\S*))(\s+|\b|$)/g, (_, quotedCategory, category) => {
 				query = query.withFilter(FilterType.Category, category || quotedCategory);
 				return '';
 			});
 
-			// Use tag filter instead of "tag:debuggers"
 			text = text.replace(/\btag:("([^"]*)"|([^"]\S*))(\s+|\b|$)/g, (_, quotedTag, tag) => {
 				query = query.withFilter(FilterType.Tag, tag || quotedTag);
 				return '';
 			});
 
-			// Use featured filter
 			text = text.replace(/\bfeatured(\s+|\b|$)/g, () => {
 				query = query.withFilter(FilterType.Featured);
 				return '';
@@ -983,16 +1063,16 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 				query = query.withFilter(FilterType.SearchText, text);
 			}
 
-			if (extensionGalleryManifest.capabilities.extensionQuery.sorting?.some(c => c.name === SortBy.NoneOrRelevance)) {
+			if (primaryMarketplace.capabilities.extensionQuery.sorting?.some(c => c.name === SortBy.NoneOrRelevance)) {
 				query = query.withSortBy(SortBy.NoneOrRelevance);
 			}
 		} else {
-			if (extensionGalleryManifest.capabilities.extensionQuery.sorting?.some(c => c.name === SortBy.InstallCount)) {
+			if (primaryMarketplace.capabilities.extensionQuery.sorting?.some(c => c.name === SortBy.InstallCount)) {
 				query = query.withSortBy(SortBy.InstallCount);
 			}
 		}
 
-		if (options.sortBy && extensionGalleryManifest.capabilities.extensionQuery.sorting?.some(c => c.name === options.sortBy)) {
+		if (options.sortBy && primaryMarketplace.capabilities.extensionQuery.sorting?.some(c => c.name === options.sortBy)) {
 			query = query.withSortBy(options.sortBy);
 		}
 
@@ -1004,24 +1084,64 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 			query = query.withSource(options.source);
 		}
 
-		const runQuery = async (query: Query, token: CancellationToken) => {
-			const { extensions, total } = await this.queryGalleryExtensions(query, { targetPlatform: CURRENT_TARGET_PLATFORM, compatible: false, includePreRelease: !!options.includePreRelease, productVersion: options.productVersion ?? { version: this.productService.version, date: this.productService.date } }, extensionGalleryManifest, token);
-			extensions.forEach((e, index) => setTelemetry(e, ((query.pageNumber - 1) * query.pageSize) + index, options.source));
-			return { extensions, total };
+		const runQueryForMarketplace = async (marketplace: IExtensionGalleryMarketplace, queryToRun: Query, cancellationToken: CancellationToken) => {
+			const result = await this.queryGalleryExtensions(queryToRun, {
+				targetPlatform: CURRENT_TARGET_PLATFORM,
+				compatible: false,
+				includePreRelease: !!options.includePreRelease,
+				productVersion: options.productVersion ?? { version: this.productService.version, date: this.productService.date }
+			}, marketplace, cancellationToken);
+
+			result.extensions.forEach((extension, index) => setTelemetry(extension, ((queryToRun.pageNumber - 1) * queryToRun.pageSize) + index, options.source));
+			return result;
 		};
-		const { extensions, total } = await runQuery(query, token);
+
+		let selectedMarketplace: IExtensionGalleryMarketplace | undefined;
+		let selectedResult: { extensions: IGalleryExtension[]; total: number } | undefined;
+		let fallbackResult: { marketplace: IExtensionGalleryMarketplace; extensions: IGalleryExtension[]; total: number } | undefined;
+		let lastError: unknown;
+
+		for (const marketplace of marketplaces) {
+			try {
+				const result = await runQueryForMarketplace(marketplace, query, token);
+				if (!fallbackResult) {
+					fallbackResult = { marketplace, extensions: result.extensions, total: result.total };
+				}
+				if (result.extensions.length || result.total) {
+					selectedMarketplace = marketplace;
+					selectedResult = { extensions: result.extensions, total: result.total };
+					break;
+				}
+			} catch (error) {
+				lastError = error;
+			}
+		}
+
+		if (!selectedMarketplace) {
+			if (fallbackResult) {
+				selectedMarketplace = fallbackResult.marketplace;
+				selectedResult = { extensions: fallbackResult.extensions, total: fallbackResult.total };
+			} else if (lastError) {
+				throw lastError;
+			} else {
+				selectedMarketplace = primaryMarketplace;
+				selectedResult = { extensions: [], total: 0 };
+			}
+		}
+
 		const getPage = async (pageIndex: number, ct: CancellationToken) => {
 			if (ct.isCancellationRequested) {
 				throw new CancellationError();
 			}
-			const { extensions } = await runQuery(query.withPage(pageIndex + 1), ct);
-			return extensions;
+			const pageQuery = query.withPage(pageIndex + 1);
+			const result = await runQueryForMarketplace(selectedMarketplace!, pageQuery, ct);
+			return result.extensions;
 		};
 
-		return { firstPage: extensions, total, pageSize: query.pageSize, getPage };
+		return { firstPage: selectedResult!.extensions, total: selectedResult!.total, pageSize: query.pageSize, getPage };
 	}
 
-	private async queryGalleryExtensions(query: Query, criteria: ExtensionsCriteria, extensionGalleryManifest: IExtensionGalleryManifest, token: CancellationToken): Promise<{ extensions: IGalleryExtension[]; total: number }> {
+	private async queryGalleryExtensions(query: Query, criteria: ExtensionsCriteria, extensionGalleryManifest: IExtensionGalleryMarketplace, token: CancellationToken): Promise<{ extensions: IGalleryExtension[]; total: number }> {
 		if (
 			this.productService.quality !== 'stable'
 			&& (await this.assignmentService?.getTreatment<boolean>('useLatestPrereleaseAndStableVersionFlag'))
@@ -1032,7 +1152,7 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 		return this.queryGalleryExtensionsWithAllVersionsAsFallback(query, criteria, extensionGalleryManifest, token);
 	}
 
-	private async queryGalleryExtensionsWithAllVersionsAsFallback(query: Query, criteria: ExtensionsCriteria, extensionGalleryManifest: IExtensionGalleryManifest, token: CancellationToken): Promise<{ extensions: IGalleryExtension[]; total: number }> {
+	private async queryGalleryExtensionsWithAllVersionsAsFallback(query: Query, criteria: ExtensionsCriteria, extensionGalleryManifest: IExtensionGalleryMarketplace, token: CancellationToken): Promise<{ extensions: IGalleryExtension[]; total: number }> {
 		const flags = query.flags;
 
 		/**
@@ -1156,7 +1276,7 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 		return { extensions: result.sort((a, b) => a[0] - b[0]).map(([, extension]) => extension), total };
 	}
 
-	private async queryGalleryExtensionsUsingIncludeLatestPrereleaseAndStableVersionFlag(query: Query, criteria: ExtensionsCriteria, extensionGalleryManifest: IExtensionGalleryManifest, token: CancellationToken): Promise<{ extensions: IGalleryExtension[]; total: number }> {
+	private async queryGalleryExtensionsUsingIncludeLatestPrereleaseAndStableVersionFlag(query: Query, criteria: ExtensionsCriteria, extensionGalleryManifest: IExtensionGalleryMarketplace, token: CancellationToken): Promise<{ extensions: IGalleryExtension[]; total: number }> {
 
 		/**
 		 * If versions criteria exist, then remove latest flags and add all versions flag.
@@ -1266,7 +1386,7 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 		return rawGalleryExtension.versions[0];
 	}
 
-	private async queryRawGalleryExtensions(query: Query, extensionGalleryManifest: IExtensionGalleryManifest, token: CancellationToken): Promise<IRawGalleryExtensionsResult> {
+	private async queryRawGalleryExtensions(query: Query, extensionGalleryManifest: IExtensionGalleryMarketplace, token: CancellationToken): Promise<IRawGalleryExtensionsResult> {
 		const extensionsQueryApi = getExtensionGalleryManifestResourceUri(extensionGalleryManifest, ExtensionGalleryResourceType.ExtensionQueryService);
 
 		if (!extensionsQueryApi) {
@@ -1554,21 +1674,25 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 	}
 
 	async reportStatistic(publisher: string, name: string, version: string, type: StatisticType): Promise<void> {
-		const manifest = await this.extensionGalleryManifestService.getExtensionGalleryManifest();
-		if (!manifest) {
+		const compositeManifest = await this.extensionGalleryManifestService.getExtensionGalleryManifest();
+		if (!compositeManifest) {
+			return undefined;
+		}
+		const marketplace = getPrimaryExtensionGalleryMarketplace(compositeManifest);
+		if (!marketplace) {
 			return undefined;
 		}
 
 		let url: string;
 
 		if (isWeb) {
-			const resource = getExtensionGalleryManifestResourceUri(manifest, ExtensionGalleryResourceType.WebExtensionStatisticsUri);
+			const resource = getExtensionGalleryManifestResourceUri(marketplace, ExtensionGalleryResourceType.WebExtensionStatisticsUri);
 			if (!resource) {
 				return;
 			}
 			url = format2(resource, { publisher, name, version, statTypeValue: type === StatisticType.Install ? '1' : '3' });
 		} else {
-			const resource = getExtensionGalleryManifestResourceUri(manifest, ExtensionGalleryResourceType.ExtensionStatisticsUri);
+			const resource = getExtensionGalleryManifestResourceUri(marketplace, ExtensionGalleryResourceType.ExtensionStatisticsUri);
 			if (!resource) {
 				return;
 			}
@@ -1693,9 +1817,13 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 	}
 
 	private async getVersions(extensionIdentifier: IExtensionIdentifier, onlyCompatible?: { version: VersionKind; targetPlatform: TargetPlatform }): Promise<IGalleryExtensionVersion[]> {
-		const extensionGalleryManifest = await this.extensionGalleryManifestService.getExtensionGalleryManifest();
-		if (!extensionGalleryManifest) {
+		const compositeManifest = await this.extensionGalleryManifestService.getExtensionGalleryManifest();
+		if (!compositeManifest) {
 			throw new Error('No extension gallery service configured.');
+		}
+		const marketplaces = getExtensionGalleryMarketplaces(compositeManifest);
+		if (!marketplaces.length) {
+			throw new Error('No extension gallery marketplace configured.');
 		}
 
 		let query = new Query()
@@ -1708,7 +1836,15 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 			query = query.withFilter(FilterType.ExtensionName, extensionIdentifier.id);
 		}
 
-		const { galleryExtensions } = await this.queryRawGalleryExtensions(query, extensionGalleryManifest, CancellationToken.None);
+		let galleryExtensions: IRawGalleryExtension[] = [];
+		for (const marketplace of marketplaces) {
+			const result = await this.queryRawGalleryExtensions(query, marketplace, CancellationToken.None);
+			if (result.galleryExtensions.length) {
+				galleryExtensions = result.galleryExtensions;
+				break;
+			}
+		}
+
 		if (!galleryExtensions.length) {
 			return [];
 		}

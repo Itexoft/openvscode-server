@@ -86,7 +86,7 @@ import { IHoverService } from '../../../../platform/hover/browser/hover.js';
 import { ByteSize, IFileService } from '../../../../platform/files/common/files.js';
 import { IUserDataProfilesService } from '../../../../platform/userDataProfile/common/userDataProfile.js';
 import { IRemoteAgentService } from '../../../services/remote/common/remoteAgentService.js';
-import { IExtensionGalleryManifestService } from '../../../../platform/extensionManagement/common/extensionGalleryManifest.js';
+import { IExtensionGalleryManifestService, getPrimaryExtensionGalleryMarketplace } from '../../../../platform/extensionManagement/common/extensionGalleryManifest.js';
 import { ShowCurrentReleaseNotesActionId } from '../../update/common/update.js';
 
 function toDateString(date: Date) {
@@ -1070,7 +1070,8 @@ class AdditionalDetailsWidget extends Disposable {
 			const categoriesElement = append(categoriesContainer, $('.categories'));
 			this.extensionGalleryManifestService.getExtensionGalleryManifest()
 				.then(manifest => {
-					const hasCategoryFilter = manifest?.capabilities.extensionQuery.filtering?.some(({ name }) => name === FilterType.Category);
+					const marketplace = getPrimaryExtensionGalleryMarketplace(manifest);
+					const hasCategoryFilter = marketplace?.capabilities.extensionQuery.filtering?.some(({ name }) => name === FilterType.Category);
 					for (const category of extension.categories) {
 						const categoryElement = append(categoriesElement, $('span.category', { tabindex: '0' }, category));
 						if (hasCategoryFilter) {

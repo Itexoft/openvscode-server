@@ -9,7 +9,7 @@ import { IHeaders } from '../../../../base/parts/request/common/request.js';
 import { localize } from '../../../../nls.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
-import { IExtensionGalleryManifestService, IExtensionGalleryManifest, ExtensionGalleryServiceUrlConfigKey, ExtensionGalleryManifestStatus } from '../../../../platform/extensionManagement/common/extensionGalleryManifest.js';
+import { IExtensionGalleryManifestService, IExtensionGalleryCompositeManifest, IExtensionGalleryMarketplace, ExtensionGalleryServiceUrlConfigKey, ExtensionGalleryManifestStatus, getExtensionGalleryMarketplaces } from '../../../../platform/extensionManagement/common/extensionGalleryManifest.js';
 import { ExtensionGalleryManifestService as ExtensionGalleryManifestService } from '../../../../platform/extensionManagement/common/extensionGalleryManifestService.js';
 import { resolveMarketplaceHeaders } from '../../../../platform/externalServices/common/marketplace.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
@@ -29,9 +29,9 @@ import { IDefaultAccount } from '../../../../base/common/defaultAccount.js';
 export class WorkbenchExtensionGalleryManifestService extends ExtensionGalleryManifestService implements IExtensionGalleryManifestService {
 
 	private readonly commonHeadersPromise: Promise<IHeaders>;
-	private extensionGalleryManifest: IExtensionGalleryManifest | null = null;
+	private extensionGalleryManifest: IExtensionGalleryCompositeManifest | null = null;
 
-	private _onDidChangeExtensionGalleryManifest = this._register(new Emitter<IExtensionGalleryManifest | null>());
+	private _onDidChangeExtensionGalleryManifest = this._register(new Emitter<IExtensionGalleryCompositeManifest | null>());
 	override readonly onDidChangeExtensionGalleryManifest = this._onDidChangeExtensionGalleryManifest.event;
 
 	private currentStatus: ExtensionGalleryManifestStatus = ExtensionGalleryManifestStatus.Unavailable;
@@ -75,7 +75,7 @@ export class WorkbenchExtensionGalleryManifestService extends ExtensionGalleryMa
 	}
 
 	private extensionGalleryManifestPromise: Promise<void> | undefined;
-	override async getExtensionGalleryManifest(): Promise<IExtensionGalleryManifest | null> {
+	override async getExtensionGalleryManifest(): Promise<IExtensionGalleryCompositeManifest | null> {
 		if (!this.extensionGalleryManifestPromise) {
 			this.extensionGalleryManifestPromise = this.doGetExtensionGalleryManifest();
 		}
@@ -126,12 +126,13 @@ export class WorkbenchExtensionGalleryManifestService extends ExtensionGalleryMa
 		}
 	}
 
-	private update(manifest: IExtensionGalleryManifest | null, status?: ExtensionGalleryManifestStatus): void {
+	private update(manifest: IExtensionGalleryCompositeManifest | null, status?: ExtensionGalleryManifestStatus): void {
 		if (this.extensionGalleryManifest !== manifest) {
 			this.extensionGalleryManifest = manifest;
 			this._onDidChangeExtensionGalleryManifest.fire(manifest);
 		}
-		this.updateStatus(status ?? (this.extensionGalleryManifest ? ExtensionGalleryManifestStatus.Available : ExtensionGalleryManifestStatus.Unavailable));
+		const hasMarketplaces = getExtensionGalleryMarketplaces(this.extensionGalleryManifest).length > 0;
+		this.updateStatus(status ?? (hasMarketplaces ? ExtensionGalleryManifestStatus.Available : ExtensionGalleryManifestStatus.Unavailable));
 	}
 
 	private updateStatus(status: ExtensionGalleryManifestStatus): void {
@@ -161,7 +162,7 @@ export class WorkbenchExtensionGalleryManifestService extends ExtensionGalleryMa
 		}
 	}
 
-	private async getExtensionGalleryManifestFromServiceUrl(url: string): Promise<IExtensionGalleryManifest> {
+	private async getExtensionGalleryManifestFromServiceUrl(url: string): Promise<IExtensionGalleryCompositeManifest> {
 		const commonHeaders = await this.commonHeadersPromise;
 		const headers = {
 			...commonHeaders,
@@ -176,13 +177,24 @@ export class WorkbenchExtensionGalleryManifestService extends ExtensionGalleryMa
 				headers,
 			}, CancellationToken.None);
 
-			const extensionGalleryManifest = await asJson<IExtensionGalleryManifest>(context);
+			const extensionGalleryManifest = await asJson<IExtensionGalleryCompositeManifest | IExtensionGalleryMarketplace | null>(context);
 
 			if (!extensionGalleryManifest) {
 				throw new Error('Unable to retrieve extension gallery manifest.');
 			}
 
-			return extensionGalleryManifest;
+			// Enterprise manifest endpoint returns a single marketplace manifest.
+			if ('marketplaces' in extensionGalleryManifest) {
+				return extensionGalleryManifest;
+			}
+
+			const marketplace: IExtensionGalleryMarketplace = {
+				...extensionGalleryManifest,
+				marketplaceId: url,
+				serviceUrl: url
+			};
+
+			return { marketplaces: [marketplace] };
 		} catch (error) {
 			this.logService.error('[Marketplace] Error retrieving extension gallery manifest', error);
 			throw error;

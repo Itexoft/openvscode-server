@@ -42,7 +42,11 @@ const textMimeType: { [ext: string]: string | undefined } = {
  */
 export async function serveError(req: http.IncomingMessage, res: http.ServerResponse, errorCode: number, errorMessage: string): Promise<void> {
 	res.writeHead(errorCode, { 'Content-Type': 'text/plain' });
-	res.end(errorMessage);
+	if (req.method === 'HEAD') {
+		res.end();
+	} else {
+		res.end(errorMessage);
+	}
 }
 
 export const enum CacheControl {
@@ -75,8 +79,12 @@ export async function serveFile(filePath: string, cacheControl: CacheControl, lo
 
 		res.writeHead(200, responseHeaders);
 
-		// Data
-		createReadStream(filePath).pipe(res);
+		if (req.method === 'HEAD') {
+			res.end();
+		} else {
+			// Data
+			createReadStream(filePath).pipe(res);
+		}
 	} catch (error) {
 		if (error.code !== 'ENOENT') {
 			logService.error(error);
@@ -86,6 +94,10 @@ export async function serveFile(filePath: string, cacheControl: CacheControl, lo
 		}
 
 		res.writeHead(404, { 'Content-Type': 'text/plain' });
+		if (req.method === 'HEAD') {
+			return void res.end();
+		}
+
 		return void res.end('Not found');
 	}
 }
@@ -241,7 +253,43 @@ export class WebClientServer {
 
 		const getFirstHeader = (headerName: string) => {
 			const val = req.headers[headerName];
-			return Array.isArray(val) ? val[0] : val;
+			const candidate = Array.isArray(val) ? val[0] : val;
+			if (!candidate) {
+				return undefined;
+			}
+			const [first] = candidate.split(',');
+			const trimmed = first?.trim();
+			return trimmed || undefined;
+		};
+
+		const normalizeAuthority = (authority: string | undefined) => {
+			if (!authority) {
+				return undefined;
+			}
+			return authority.trim();
+		};
+
+		const isPrivateAuthority = (authority: string | undefined) => {
+			if (!authority) {
+				return true;
+			}
+			const bracketStripped = authority.startsWith('[') && authority.endsWith(']')
+				? authority.slice(1, -1)
+				: authority;
+			const host = bracketStripped.split(':')[0]?.toLowerCase();
+			if (!host) {
+				return true;
+			}
+			if (host === 'localhost' || host === '127.0.0.1' || host === '::1') {
+				return true;
+			}
+			if (/^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host) || /^169\.254\./.test(host)) {
+				return true;
+			}
+			if (/^fc[0-9a-f]{2}/.test(host) || /^fd[0-9a-f]{2}/.test(host)) {
+				return true;
+			}
+			return false;
 		};
 
 		// Prefix routes with basePath for clients
@@ -284,22 +332,34 @@ export class WebClientServer {
 		};
 
 		const useTestResolver = (!this._environmentService.isBuilt && this._environmentService.args['use-test-resolver']);
-		let remoteAuthority = (
-			useTestResolver
-				? 'test+test'
-				: (getFirstHeader('x-original-host') || getFirstHeader('x-forwarded-host') || req.headers.host)
-		);
+		const proxyHostOverride = this._environmentService.args['proxy-host'];
+		const proxyPortOverride = this._environmentService.args['proxy-port'];
+		let remoteAuthority: string | undefined;
+		if (useTestResolver) {
+				remoteAuthority = 'test+test';
+			} else if (proxyHostOverride) {
+				remoteAuthority = proxyPortOverride ? `${proxyHostOverride}:${proxyPortOverride}` : proxyHostOverride;
+			} else {
+				const candidates: (string | undefined)[] = [
+					getFirstHeader('x-original-host'),
+					getFirstHeader('x-forwarded-host'),
+					normalizeAuthority(req.headers.host)
+				];
+				remoteAuthority = candidates.find(candidate => !!candidate && !isPrivateAuthority(candidate)) ?? candidates.find(candidate => !!candidate);
+			}
 		if (!remoteAuthority) {
-			return serveError(req, res, 400, `Bad request.`);
-		}
-		const forwardedPort = getFirstHeader('x-forwarded-port');
-		if (forwardedPort) {
-			remoteAuthority = replacePort(remoteAuthority, forwardedPort);
-		}
+				return serveError(req, res, 400, `Bad request.`);
+			}
+		if (!proxyHostOverride) {
+				const forwardedPort = getFirstHeader('x-forwarded-port');
+				if (forwardedPort) {
+					remoteAuthority = replacePort(remoteAuthority, forwardedPort);
+				}
+			}
 
 		function asJSON(value: unknown): string {
-			return JSON.stringify(value).replace(/"/g, '&quot;');
-		}
+				return JSON.stringify(value).replace(/"/g, '&quot;');
+			}
 
 		let _wrapWebWorkerExtHostInIframe: undefined | false = undefined;
 		if (this._environmentService.args['enable-smoke-test-driver']) {
@@ -309,14 +369,17 @@ export class WebClientServer {
 		}
 
 		if (this._logService.getLevel() === LogLevel.Trace) {
-			['x-original-host', 'x-forwarded-host', 'x-forwarded-port', 'host'].forEach(header => {
-				const value = getFirstHeader(header);
-				if (value) {
-					this._logService.trace(`[WebClientServer] ${header}: ${value}`);
+				['x-original-host', 'x-forwarded-host', 'x-forwarded-port', 'host'].forEach(header => {
+					const value = getFirstHeader(header);
+					if (value) {
+						this._logService.trace(`[WebClientServer] ${header}: ${value}`);
+					}
+				});
+				if (proxyHostOverride) {
+					this._logService.trace(`[WebClientServer] proxy-host override in effect: ${remoteAuthority}`);
 				}
-			});
-			this._logService.trace(`[WebClientServer] Request URL: ${req.url}, basePath: ${basePath}, remoteAuthority: ${remoteAuthority}`);
-		}
+				this._logService.trace(`[WebClientServer] Request URL: ${req.url}, basePath: ${basePath}, remoteAuthority: ${remoteAuthority}`);
+			}
 
 		const staticRoute = posix.join(basePath, this._productPath, STATIC_PATH);
 		const callbackRoute = posix.join(basePath, this._productPath, CALLBACK_PATH);
@@ -399,7 +462,7 @@ export class WebClientServer {
 			values['WORKBENCH_DEV_CSS_MODULES'] = JSON.stringify(cssModules);
 		}
 
-		if (useTestResolver) {
+	if (useTestResolver) {
 			const bundledExtensions: { extensionPath: string; packageJSON: IExtensionManifest }[] = [];
 			for (const extensionPath of ['vscode-test-resolver', 'github-authentication']) {
 				const packageJSON = JSON.parse((await promises.readFile(FileAccess.asFileUri(`${builtinExtensionsPath}/${extensionPath}/package.json`).fsPath)).toString());

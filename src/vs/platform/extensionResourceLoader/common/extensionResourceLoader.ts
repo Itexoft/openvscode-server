@@ -17,7 +17,7 @@ import { TelemetryLevel } from '../../telemetry/common/telemetry.js';
 import { getTelemetryLevel, supportsTelemetry } from '../../telemetry/common/telemetryUtils.js';
 import { RemoteAuthorities } from '../../../base/common/network.js';
 import { TargetPlatform } from '../../extensions/common/extensions.js';
-import { ExtensionGalleryResourceType, getExtensionGalleryManifestResourceUri, IExtensionGalleryManifest, IExtensionGalleryManifestService } from '../../extensionManagement/common/extensionGalleryManifest.js';
+import { ExtensionGalleryResourceType, getExtensionGalleryManifestResourceUri, getPrimaryExtensionGalleryMarketplace, IExtensionGalleryCompositeManifest, IExtensionGalleryManifestService } from '../../extensionManagement/common/extensionGalleryManifest.js';
 import { ILogService } from '../../log/common/log.js';
 import { Disposable } from '../../../base/common/lifecycle.js';
 
@@ -96,8 +96,9 @@ export abstract class AbstractExtensionResourceLoaderService extends Disposable 
 		}
 	}
 
-	private resolve(manifest: IExtensionGalleryManifest | null): void {
-		this._extensionGalleryResourceUrlTemplate = manifest ? getExtensionGalleryManifestResourceUri(manifest, ExtensionGalleryResourceType.ExtensionResourceUri) : undefined;
+	private resolve(manifest: IExtensionGalleryCompositeManifest | null): void {
+		const marketplace = getPrimaryExtensionGalleryMarketplace(manifest);
+		this._extensionGalleryResourceUrlTemplate = marketplace ? getExtensionGalleryManifestResourceUri(marketplace, ExtensionGalleryResourceType.ExtensionResourceUri) : undefined;
 		this._extensionGalleryAuthority = this._extensionGalleryResourceUrlTemplate ? this._getExtensionGalleryAuthority(URI.parse(this._extensionGalleryResourceUrlTemplate)) : undefined;
 	}
 

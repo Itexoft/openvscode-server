@@ -55,7 +55,7 @@ import { ITelemetryService } from '../../telemetry/common/telemetry.js';
 import { IUriIdentityService } from '../../uriIdentity/common/uriIdentity.js';
 import { IUserDataProfilesService } from '../../userDataProfile/common/userDataProfile.js';
 import { IConfigurationService } from '../../configuration/common/configuration.js';
-import { IExtensionGalleryManifestService } from '../common/extensionGalleryManifest.js';
+import { IExtensionGalleryManifestService, getPrimaryExtensionGalleryMarketplace } from '../common/extensionGalleryManifest.js';
 
 export const INativeServerExtensionManagementService = refineServiceDecorator<IExtensionManagementService, INativeServerExtensionManagementService>(IExtensionManagementService);
 export interface INativeServerExtensionManagementService extends IExtensionManagementService {
@@ -352,7 +352,9 @@ export class ExtensionManagementService extends AbstractExtensionManagementServi
 			}
 		}
 		const { location, verificationStatus } = await this.extensionsDownloader.download(extension, operation, verifySignature, clientTargetPlatform);
-		const shouldRequireSignature = shouldRequireRepositorySignatureFor(extension.private, await this.extensionGalleryManifestService.getExtensionGalleryManifest());
+		const galleryManifest = await this.extensionGalleryManifestService.getExtensionGalleryManifest();
+		const primaryMarketplace = getPrimaryExtensionGalleryMarketplace(galleryManifest);
+		const shouldRequireSignature = shouldRequireRepositorySignatureFor(extension.private, primaryMarketplace ?? null);
 
 		if (
 			verificationStatus !== ExtensionSignatureVerificationCode.Success

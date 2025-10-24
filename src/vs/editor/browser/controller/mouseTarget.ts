@@ -352,8 +352,12 @@ export class HitTestContext {
 
 	private static _findAttribute(element: Element, attr: string, stopAt: Element): string | null {
 		while (element && element !== element.ownerDocument.body) {
-			if (element.hasAttribute && element.hasAttribute(attr)) {
+			const hasAttributeFn = (typeof (element as any).hasAttribute === 'function') ? element.hasAttribute.bind(element) : null;
+			if (hasAttributeFn && hasAttributeFn(attr)) {
 				return element.getAttribute(attr);
+			}
+			if ((element as any).hasAttribute && !hasAttributeFn) {
+				console.warn('[mouseTarget] element.hasAttribute is not a function', element);
 			}
 			if (element === stopAt) {
 				return null;

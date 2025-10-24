@@ -105,9 +105,11 @@ class RemoteExtensionHostAgentServer extends Disposable implements IServerAPI {
 
 	public async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
 		// Only serve GET requests
-		if (req.method !== 'GET') {
+		if (req.method !== 'GET' && req.method !== 'HEAD') {
 			return serveError(req, res, 405, `Unsupported method ${req.method}`);
 		}
+
+		const isHead = req.method === 'HEAD';
 
 		if (!req.url) {
 			return serveError(req, res, 400, `Bad request.`);
@@ -131,15 +133,16 @@ class RemoteExtensionHostAgentServer extends Disposable implements IServerAPI {
 
 		// Version
 		if (pathname === '/version') {
-			res.writeHead(200, { 'Content-Type': 'text/plain' });
-			return void res.end(this._productService.commit || '');
+			const headers = { 'Content-Type': 'text/plain' };
+			res.writeHead(200, headers);
+			return void (isHead ? res.end() : res.end(this._productService.commit || ''));
 		}
 
 		// Delay shutdown
 		if (pathname === '/delay-shutdown') {
 			this._delayShutdown();
 			res.writeHead(200);
-			return void res.end('OK');
+			return void (isHead ? res.end() : res.end('OK'));
 		}
 
 		if (!httpRequestHasValidConnectionToken(this._connectionToken, req, parsedUrl)) {
@@ -187,7 +190,7 @@ class RemoteExtensionHostAgentServer extends Disposable implements IServerAPI {
 		}
 
 		res.writeHead(404, { 'Content-Type': 'text/plain' });
-		return void res.end('Not found');
+		return void (isHead ? res.end() : res.end('Not found'));
 	}
 
 	public handleUpgrade(req: http.IncomingMessage, socket: net.Socket) {

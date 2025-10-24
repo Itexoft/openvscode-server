@@ -50,7 +50,7 @@ import { IUriIdentityService } from '../../../../platform/uriIdentity/common/uri
 import { IExplorerService } from '../../files/browser/files.js';
 import { IViewsService } from '../../../services/views/common/viewsService.js';
 import { VIEW_ID as EXPLORER_VIEW_ID } from '../../files/common/files.js';
-import { IExtensionGalleryManifest, IExtensionGalleryManifestService } from '../../../../platform/extensionManagement/common/extensionGalleryManifest.js';
+import { IExtensionGalleryCompositeManifest, IExtensionGalleryManifestService, getPrimaryExtensionGalleryMarketplace } from '../../../../platform/extensionManagement/common/extensionGalleryManifest.js';
 
 export abstract class ExtensionWidget extends Disposable implements IExtensionContainer {
 	private _extension: IExtension | null = null;
@@ -591,7 +591,7 @@ export class ExtensionPackCountWidget extends ExtensionWidget {
 export class ExtensionKindIndicatorWidget extends ExtensionWidget {
 
 	private element: HTMLElement | undefined;
-	private extensionGalleryManifest: IExtensionGalleryManifest | null = null;
+	private extensionGalleryManifest: IExtensionGalleryCompositeManifest | null = null;
 
 	private readonly disposables = this._register(new DisposableStore());
 
@@ -629,9 +629,11 @@ export class ExtensionKindIndicatorWidget extends ExtensionWidget {
 			return;
 		}
 
+		const primaryMarketplace = getPrimaryExtensionGalleryMarketplace(this.extensionGalleryManifest);
+
 		if (this.extension?.private) {
 			this.element = append(this.container, $('.extension-kind-indicator'));
-			if (!this.small || (this.extensionGalleryManifest?.capabilities.extensions?.includePublicExtensions && this.extensionGalleryManifest?.capabilities.extensions?.includePrivateExtensions)) {
+			if (!this.small || (primaryMarketplace?.capabilities.extensions?.includePublicExtensions && primaryMarketplace?.capabilities.extensions?.includePrivateExtensions)) {
 				append(this.element, $('span' + ThemeIcon.asCSSSelector(privateExtensionIcon)));
 			}
 			if (!this.small) {
