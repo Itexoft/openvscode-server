@@ -7,7 +7,7 @@ import { Disposable } from '../../../../base/common/lifecycle.js';
 import { IChannel, IServerChannel, getDelayedChannel, IPCLogger } from '../../../../base/parts/ipc/common/ipc.js';
 import { Client } from '../../../../base/parts/ipc/common/ipc.net.js';
 import { IWorkbenchEnvironmentService } from '../../environment/common/environmentService.js';
-import { connectRemoteAgentManagement, IConnectionOptions, ManagementPersistentConnection, PersistentConnectionEvent } from '../../../../platform/remote/common/remoteAgentConnection.js';
+import { connectRemoteAgentManagement, IConnectionOptions, ManagementPersistentConnection, PersistentConnectionEvent, PersistentConnectionEventType } from '../../../../platform/remote/common/remoteAgentConnection.js';
 import { IExtensionHostExitInfo, IRemoteAgentConnection, IRemoteAgentService } from './remoteAgentService.js';
 import { IRemoteAuthorityResolverService } from '../../../../platform/remote/common/remoteAuthorityResolver.js';
 import { RemoteAgentConnectionContext, IRemoteAgentEnvironment } from '../../../../platform/remote/common/remoteAgentEnvironment.js';
@@ -27,6 +27,7 @@ export abstract class AbstractRemoteAgentService extends Disposable implements I
 
 	private readonly _connection: IRemoteAgentConnection | null;
 	private _environment: Promise<IRemoteAgentEnvironment | null> | null;
+	private readonly _logService: ILogService;
 
 	constructor(
 		@IRemoteSocketFactoryService private readonly remoteSocketFactoryService: IRemoteSocketFactoryService,
@@ -38,12 +39,29 @@ export abstract class AbstractRemoteAgentService extends Disposable implements I
 		@ILogService logService: ILogService
 	) {
 		super();
+		this._logService = logService;
 		if (this._environmentService.remoteAuthority) {
 			this._connection = this._register(new RemoteAgentConnection(this._environmentService.remoteAuthority, productService.commit, productService.quality, this.remoteSocketFactoryService, this._remoteAuthorityResolverService, signService, logService));
 		} else {
 			this._connection = null;
 		}
 		this._environment = null;
+		if (this._connection) {
+			this._register(this._connection.onDidStateChange(event => {
+				if (event.type === PersistentConnectionEventType.ConnectionLost) {
+					this._logService.info('[remoteAgentService] Connection lost – dropping cached environment.');
+					this._environment = null;
+				} else if (event.type === PersistentConnectionEventType.ConnectionGain) {
+					// Only log on actual reconnects (attempt > 0) to avoid noise.
+					if (event.attempt > 0) {
+						this._logService.info('[remoteAgentService] Connection re-established – refreshing environment cache on next access.');
+					} else {
+						this._logService.trace('[remoteAgentService] Connection gain event (initial).');
+					}
+					this._environment = null;
+				}
+			}));
+		}
 	}
 
 	getConnection(): IRemoteAgentConnection | null {

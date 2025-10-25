@@ -104,12 +104,13 @@ class RemoteExtensionHostAgentServer extends Disposable implements IServerAPI {
 	}
 
 	public async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-		// Only serve GET requests
-		if (req.method !== 'GET' && req.method !== 'HEAD') {
+		const method = req.method?.toUpperCase();
+		if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
 			return serveError(req, res, 405, `Unsupported method ${req.method}`);
 		}
 
-		const isHead = req.method === 'HEAD';
+		const isHead = method === 'HEAD';
+		const isOptions = method === 'OPTIONS';
 
 		if (!req.url) {
 			return serveError(req, res, 400, `Bad request.`);
@@ -123,17 +124,35 @@ class RemoteExtensionHostAgentServer extends Disposable implements IServerAPI {
 		}
 
 		// Serve from both '/' and serverBasePath
-		if (this._serverBasePath !== undefined && pathname.startsWith(this._serverBasePath)) {
-			pathname = pathname.substring(this._serverBasePath.length) || '/';
-		}
-		// for now accept all paths, with or without server product path
-		if (pathname.startsWith(this._serverProductPath) && pathname.charCodeAt(this._serverProductPath.length) === CharCode.Slash) {
-			pathname = pathname.substring(this._serverProductPath.length);
-		}
+			if (this._serverBasePath !== undefined && pathname.startsWith(this._serverBasePath)) {
+				pathname = pathname.substring(this._serverBasePath.length) || '/';
+			}
+			// for now accept all paths, with or without server product path
+			if (pathname.startsWith(this._serverProductPath) && pathname.charCodeAt(this._serverProductPath.length) === CharCode.Slash) {
+				pathname = pathname.substring(this._serverProductPath.length);
+			}
 
-		// Version
+			if (isOptions) {
+				if (this._webClientServer) {
+					return this._webClientServer.handle(req, res, parsedUrl, pathname);
+				}
+				return serveError(req, res, 405, `Unsupported method ${req.method}`);
+			}
+
+			// Version
 		if (pathname === '/version') {
 			const headers = { 'Content-Type': 'text/plain' };
+			const remote = req.socket?.remoteAddress ?? 'unknown';
+			this._logService.info(`[diag] /version ${isHead ? 'HEAD' : 'GET'} from ${remote}`);
+			const now = Date.now();
+			const managementTokens = Object.keys(this._managementConnections ?? {}).map(token => token.slice(0, 8));
+			const extHostTokens = Object.entries(this._extHostConnections ?? {}).map(([token, con]) => `${token.slice(0, 8)}:${con?.isDisposed() ? 'disposed' : 'alive'}`);
+			const extHostStatus = Object.values(this._extHostConnections ?? {}).map(con => {
+				const lifetime = con ? `${now - con.getCreatedAt()}ms` : 'unknown';
+				const disposed = con?.isDisposed() ? 'disposed' : 'alive';
+				return `${disposed}/${lifetime}`;
+			});
+			this._logService.info(`[diag] /version state management=${managementTokens.join(',')} extHosts=${extHostTokens.join(',')} lifetimes=${extHostStatus.join(',')}`);
 			res.writeHead(200, headers);
 			return void (isHead ? res.end() : res.end(this._productService.commit || ''));
 		}
@@ -145,9 +164,43 @@ class RemoteExtensionHostAgentServer extends Disposable implements IServerAPI {
 			return void (isHead ? res.end() : res.end('OK'));
 		}
 
-		if (!httpRequestHasValidConnectionToken(this._connectionToken, req, parsedUrl)) {
-			// invalid connection token
-			return serveError(req, res, 403, `Forbidden.`);
+			if (!httpRequestHasValidConnectionToken(this._connectionToken, req, parsedUrl)) {
+				console.log(`[RemoteExtensionHostAgentServer] Invalid connection token for ${req.method} ${req.url} origin=${req.headers.origin ?? ''}`);
+				// invalid connection token
+				return serveError(req, res, 403, `Forbidden.`);
+			}
+
+		if (pathname.startsWith('/static/node_modules/vsda/')) {
+			if (pathname.endsWith('/vsda.js')) {
+				const stub = `
+define(function () {
+	const NoopValidator = function () { };
+	NoopValidator.prototype.createNewMessage = function (message) { return message; };
+	NoopValidator.prototype.validate = function () { return 'ok'; };
+	NoopValidator.prototype.dispose = function () { };
+
+	const NoopSigner = function () { };
+	NoopSigner.prototype.sign = async function (value) { return value; };
+	NoopSigner.prototype.dispose = function () { };
+
+	return { validator: NoopValidator, signer: NoopSigner };
+});
+`.trim();
+				res.writeHead(200, {
+					'Content-Type': 'text/javascript',
+					'Cache-Control': 'public, max-age=31536000'
+				});
+				return void (isHead ? res.end() : res.end(stub));
+			}
+
+			if (pathname.endsWith('/vsda_bg.wasm')) {
+				const wasmStub = Buffer.from('0061736d01000000', 'hex'); // minimal wasm header
+				res.writeHead(200, {
+					'Content-Type': 'application/wasm',
+					'Cache-Control': 'public, max-age=31536000'
+				});
+				return void (isHead ? res.end() : res.end(wasmStub));
+			}
 		}
 
 		if (pathname === '/vscode-remote-resource') {
@@ -426,7 +479,9 @@ class RemoteExtensionHostAgentServer extends Disposable implements IServerAPI {
 				this._socketServer.acceptConnection(con.protocol, con.onClose);
 				this._managementConnections[reconnectionToken] = con;
 				this._allReconnectionTokens.add(reconnectionToken);
+				this._logService.info(`${logPrefix} Registered new management connection.`);
 				con.onClose(() => {
+					this._logService.info(`${logPrefix} Management connection disposed.`);
 					delete this._managementConnections[reconnectionToken];
 				});
 
@@ -476,7 +531,9 @@ class RemoteExtensionHostAgentServer extends Disposable implements IServerAPI {
 				const con = this._instantiationService.createInstance(ExtensionHostConnection, reconnectionToken, remoteAddress, socket, dataChunk);
 				this._extHostConnections[reconnectionToken] = con;
 				this._allReconnectionTokens.add(reconnectionToken);
+				this._logService.info(`${logPrefix} Registered new extension host connection.`);
 				con.onClose(() => {
+					this._logService.info(`${logPrefix} Connection disposed (token ${reconnectionToken.slice(0, 8)}).`);
 					con.dispose();
 					delete this._extHostConnections[reconnectionToken];
 					this._onDidCloseExtHostConnection();

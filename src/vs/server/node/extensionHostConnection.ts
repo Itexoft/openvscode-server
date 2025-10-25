@@ -108,6 +108,7 @@ export class ExtensionHostConnection extends Disposable {
 	private _onClose = new Emitter<void>();
 	readonly onClose: Event<void> = this._onClose.event;
 
+	private readonly _createdAt: number = Date.now();
 	private readonly _canSendSocket: boolean;
 	private _disposed: boolean;
 	private _remoteAddress: string;
@@ -129,9 +130,10 @@ export class ExtensionHostConnection extends Disposable {
 		this._disposed = false;
 		this._remoteAddress = remoteAddress;
 		this._extensionHostProcess = null;
-		this._connectionData = new ConnectionData(socket, initialDataChunk);
+		this._connectionData = this._createConnectionData(socket, initialDataChunk);
 
 		this._log(`New connection established.`);
+		this._log(`Initial data chunk length: ${initialDataChunk.byteLength} bytes.`);
 	}
 
 	override dispose(): void {
@@ -151,6 +153,14 @@ export class ExtensionHostConnection extends Disposable {
 		this._logService.error(`${this._logPrefix}${_str}`);
 	}
 
+	public isDisposed(): boolean {
+		return this._disposed;
+	}
+
+	public getCreatedAt(): number {
+		return this._createdAt;
+	}
+
 	private async _pipeSockets(extHostSocket: net.Socket, connectionData: ConnectionData): Promise<void> {
 
 		const disposables = new DisposableStore();
@@ -159,16 +169,26 @@ export class ExtensionHostConnection extends Disposable {
 			extHostSocket.destroy();
 		}));
 
-		const stopAndCleanup = () => {
+		let cleaned = false;
+		const stopAndCleanup = (reason: string) => {
+			if (cleaned) {
+				return;
+			}
+			cleaned = true;
+			this._log(`Connection transport disposing (reason=${reason}).`);
 			disposables.dispose();
 		};
 
-		disposables.add(connectionData.socket.onEnd(stopAndCleanup));
-		disposables.add(connectionData.socket.onClose(stopAndCleanup));
+		disposables.add(connectionData.socket.onEnd(() => stopAndCleanup('client socket end')));
+		disposables.add(connectionData.socket.onClose((hadError) => stopAndCleanup(`client socket close (hadError=${hadError})`)));
 
-		disposables.add(Event.fromNodeEventEmitter<void>(extHostSocket, 'end')(stopAndCleanup));
-		disposables.add(Event.fromNodeEventEmitter<void>(extHostSocket, 'close')(stopAndCleanup));
-		disposables.add(Event.fromNodeEventEmitter<void>(extHostSocket, 'error')(stopAndCleanup));
+		disposables.add(Event.fromNodeEventEmitter<void>(extHostSocket, 'end')(() => stopAndCleanup('extHostSocket end')));
+		disposables.add(Event.fromNodeEventEmitter<boolean>(extHostSocket, 'close')((hadError) => stopAndCleanup(`extHostSocket close (hadError=${hadError})`)));
+		disposables.add(Event.fromNodeEventEmitter<Error>(extHostSocket, 'error')((err) => {
+			const message = err instanceof Error ? err.message : String(err);
+			this._logError(`<${this._extensionHostProcess?.pid ?? 'unknown'}> extHostSocket error: ${message}`);
+			stopAndCleanup('extHostSocket error');
+		}));
 
 		disposables.add(connectionData.socket.onData((e) => extHostSocket.write(e.buffer)));
 		disposables.add(Event.fromNodeEventEmitter<Buffer>(extHostSocket, 'data')((e) => {
@@ -183,6 +203,7 @@ export class ExtensionHostConnection extends Disposable {
 	private async _sendSocketToExtensionHost(extensionHostProcess: cp.ChildProcess, connectionData: ConnectionData): Promise<void> {
 		// Make sure all outstanding writes have been drained before sending the socket
 		await connectionData.socketDrain();
+		this._log(`<${extensionHostProcess.pid}> Preparing to send connection socket to extension host.`);
 		const msg = connectionData.toIExtHostSocketMessage();
 		let socket: net.Socket;
 		if (connectionData.socket instanceof NodeSocket) {
@@ -190,7 +211,13 @@ export class ExtensionHostConnection extends Disposable {
 		} else {
 			socket = connectionData.socket.socket.socket;
 		}
-		extensionHostProcess.send(msg, socket);
+		extensionHostProcess.send(msg, socket, (err) => {
+			if (err) {
+				this._logError(`<${extensionHostProcess.pid}> Failed to send socket to extension host: ${err?.message ?? err}`);
+			} else {
+				this._log(`<${extensionHostProcess.pid}> Connection socket handed off to extension host.`);
+			}
+		});
 	}
 
 	public shortenReconnectionGraceTimeIfNecessary(): void {
@@ -206,15 +233,50 @@ export class ExtensionHostConnection extends Disposable {
 	public acceptReconnection(remoteAddress: string, _socket: NodeSocket | WebSocketNodeSocket, initialDataChunk: VSBuffer): void {
 		this._remoteAddress = remoteAddress;
 		this._log(`The client has reconnected.`);
-		const connectionData = new ConnectionData(_socket, initialDataChunk);
+		this._log(`Reconnection initial data chunk length: ${initialDataChunk.byteLength} bytes.`);
+		const connectionData = this._createConnectionData(_socket, initialDataChunk);
 
 		if (!this._extensionHostProcess) {
 			// The extension host didn't even start up yet
+			this._log(`Extension host process not yet running; storing connection data.`);
 			this._connectionData = connectionData;
 			return;
 		}
 
+		this._log(`Forwarding reconnection socket to extension host <${this._extensionHostProcess.pid}>.`);
 		this._sendSocketToExtensionHost(this._extensionHostProcess, connectionData);
+	}
+
+	private _createConnectionData(socket: NodeSocket | WebSocketNodeSocket, initialDataChunk: VSBuffer): ConnectionData {
+		const sanitizedChunk = this._sanitizeInitialData(initialDataChunk);
+		return new ConnectionData(socket, sanitizedChunk);
+	}
+
+	private _sanitizeInitialData(initialDataChunk: VSBuffer): VSBuffer {
+		if (!initialDataChunk.byteLength) {
+			return initialDataChunk;
+		}
+
+		try {
+			const raw = initialDataChunk.toString();
+			const parsed = JSON.parse(raw);
+			if (parsed && typeof parsed === 'object') {
+				const currentPid = process.pid;
+				const previousPid = (parsed as { parentPid?: unknown }).parentPid;
+				if (typeof currentPid === 'number' && currentPid > 0) {
+					if (previousPid !== currentPid) {
+						const previousPidDescription = typeof previousPid === 'number' ? previousPid.toString() : String(previousPid ?? 'undefined');
+						this._log(`Normalizing parentPid in init data from ${previousPidDescription} to ${currentPid}.`);
+					}
+					(parsed as { parentPid: number }).parentPid = currentPid;
+				}
+				return VSBuffer.fromString(JSON.stringify(parsed));
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this._logError(`Failed to normalize extension host init data: ${message}`);
+		}
+		return initialDataChunk;
 	}
 
 	private _cleanResources(): void {
@@ -223,11 +285,14 @@ export class ExtensionHostConnection extends Disposable {
 			return;
 		}
 		this._disposed = true;
+		this._log(`Cleaning resources (pendingConnectionData=${!!this._connectionData}, hasProcess=${!!this._extensionHostProcess}).`);
 		if (this._connectionData) {
+			this._log(`Closing pending connection data socket.`);
 			this._connectionData.socket.end();
 			this._connectionData = null;
 		}
 		if (this._extensionHostProcess) {
+			this._log(`Killing extension host process <${this._extensionHostProcess.pid}> as part of cleanup.`);
 			this._extensionHostProcess.kill();
 			this._extensionHostProcess = null;
 		}
@@ -246,6 +311,7 @@ export class ExtensionHostConnection extends Disposable {
 
 			const env = await buildUserEnvironment(startParams.env, true, startParams.language, this._environmentService, this._logService, this._configurationService);
 			removeDangerousEnvVariables(env);
+			this._log(`Starting extension host with debugPort=${startParams.port ?? "none"}, breakMode=${startParams.break ? "true" : "false"}.`);
 
 			let extHostNamedPipeServer: net.Server | null;
 
@@ -278,26 +344,45 @@ export class ExtensionHostConnection extends Disposable {
 			const pid = this._extensionHostProcess.pid;
 			this._log(`<${pid}> Launched Extension Host Process.`);
 
-			// Catch all output coming from the extension host process
-			this._extensionHostProcess.stdout!.setEncoding('utf8');
-			this._extensionHostProcess.stderr!.setEncoding('utf8');
-			const onStdout = Event.fromNodeEventEmitter<string>(this._extensionHostProcess.stdout!, 'data');
-			const onStderr = Event.fromNodeEventEmitter<string>(this._extensionHostProcess.stderr!, 'data');
-			this._register(onStdout((e) => this._log(`<${pid}> ${e}`)));
-			this._register(onStderr((e) => this._log(`<${pid}><stderr> ${e}`)));
+		// Catch all output coming from the extension host process
+		this._extensionHostProcess.stdout!.setEncoding('utf8');
+		this._extensionHostProcess.stderr!.setEncoding('utf8');
+		const onStdout = Event.fromNodeEventEmitter<string>(this._extensionHostProcess.stdout!, 'data');
+		const onStderr = Event.fromNodeEventEmitter<string>(this._extensionHostProcess.stderr!, 'data');
+		this._register(onStdout((e) => {
+			const trimmed = e.trimEnd();
+			if (trimmed.length) {
+				this._log(`<${pid}><stdout> ${trimmed}`);
+			}
+		}));
+		this._register(onStderr((e) => {
+			const trimmed = e.trimEnd();
+			if (trimmed.length) {
+				this._logError(`<${pid}><stderr> ${trimmed}`);
+			}
+		}));
 
 			// Lifecycle
-			this._extensionHostProcess.on('error', (err) => {
-				this._logError(`<${pid}> Extension Host Process had an error`);
+		this._extensionHostProcess.on('error', (err) => {
+			const lifetime = Date.now() - this._createdAt;
+			this._logError(`<${pid}> Extension Host Process emitted 'error' after ${lifetime}ms`);
+			if (err) {
 				this._logService.error(err);
+			}
 				this._cleanResources();
 			});
 
-			this._extensionHostProcess.on('exit', (code: number, signal: string) => {
-				this._extensionHostStatusService.setExitInfo(this._reconnectionToken, { code, signal });
-				this._log(`<${pid}> Extension Host Process exited with code: ${code}, signal: ${signal}.`);
-				this._cleanResources();
-			});
+		this._extensionHostProcess.on('exit', (code: number, signal: string) => {
+			this._extensionHostStatusService.setExitInfo(this._reconnectionToken, { code, signal });
+			const lifetime = Date.now() - this._createdAt;
+			if (code === 0 && !signal) {
+				this._log(`<${pid}> Extension Host Process exited normally after ${lifetime}ms.`);
+			} else {
+				this._logError(`<${pid}> Extension Host Process exited unexpectedly after ${lifetime}ms (code: ${code}, signal: ${signal}).`);
+			}
+			this._log(`<${pid}> buffered stdout/stderr up to this point processed by log handlers.`);
+			this._cleanResources();
+		});
 
 			if (extHostNamedPipeServer) {
 				extHostNamedPipeServer.on('connection', (socket) => {
@@ -305,21 +390,26 @@ export class ExtensionHostConnection extends Disposable {
 					this._pipeSockets(socket, this._connectionData!);
 				});
 			} else {
-				const messageListener = (msg: IExtHostReadyMessage) => {
-					if (msg.type === 'VSCODE_EXTHOST_IPC_READY') {
-						this._extensionHostProcess!.removeListener('message', messageListener);
-						this._sendSocketToExtensionHost(this._extensionHostProcess!, this._connectionData!);
-						this._connectionData = null;
-					}
-				};
+			const messageListener = (msg: IExtHostReadyMessage) => {
+				if (msg.type === 'VSCODE_EXTHOST_IPC_READY') {
+					this._log(`<${pid}> Extension host signalled IPC ready.`);
+					this._extensionHostProcess!.removeListener('message', messageListener);
+					this._sendSocketToExtensionHost(this._extensionHostProcess!, this._connectionData!);
+					this._connectionData = null;
+				}
+			};
 				this._extensionHostProcess.on('message', messageListener);
 			}
 
 		} catch (error) {
-			console.error('ExtensionHostConnection errored');
-			if (error) {
-				console.error(error);
+			const duration = Date.now() - this._createdAt;
+			this._logError(`ExtensionHostConnection start failed after ${duration}ms`);
+			if (error instanceof Error) {
+				this._logService.error(error);
+			} else if (error !== undefined) {
+				this._logService.error(String(error));
 			}
+			this._extensionHostStatusService.setExitInfo(this._reconnectionToken, { code: -1, signal: '' });
 		}
 	}
 

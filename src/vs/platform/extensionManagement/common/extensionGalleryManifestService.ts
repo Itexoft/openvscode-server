@@ -152,8 +152,8 @@ function toMarketplaceManifest(config: ExtensionGalleryConfig): IExtensionGaller
 export class ExtensionGalleryManifestService extends Disposable implements IExtensionGalleryManifestService {
 
 	readonly _serviceBrand: undefined;
-	readonly onDidChangeExtensionGalleryManifest = Event.None;
-	readonly onDidChangeExtensionGalleryManifestStatus = Event.None;
+	readonly onDidChangeExtensionGalleryManifest: Event<IExtensionGalleryCompositeManifest | null> = Event.None;
+	readonly onDidChangeExtensionGalleryManifestStatus: Event<ExtensionGalleryManifestStatus> = Event.None;
 
 	constructor(
 		@IProductService protected readonly productService: IProductService,

@@ -1398,7 +1398,11 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 			.withFlags(...query.flags, Flag.ExcludeNonValidated)
 			.withFilter(FilterType.Target, 'Microsoft.VisualStudio.Code');
 
-		const unpublishedFlag = extensionGalleryManifest.capabilities.extensionQuery.flags?.find(f => f.name === Flag.Unpublished);
+		const filteringCapabilities = extensionGalleryManifest.capabilities.extensionQuery.filtering ?? [];
+		const sortingCapabilities = extensionGalleryManifest.capabilities.extensionQuery.sorting ?? [];
+		const flagCapabilities = extensionGalleryManifest.capabilities.extensionQuery.flags ?? [];
+
+		const unpublishedFlag = flagCapabilities.find(({ name }) => name === Flag.Unpublished);
 		/* Always exclude unpublished extensions */
 		if (unpublishedFlag) {
 			query = query.withFilter(FilterType.ExcludeWithFlags, String(unpublishedFlag.value));
@@ -1407,25 +1411,25 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 		const data = JSON.stringify({
 			filters: [
 				{
-					criteria: query.criteria.reduce<{ filterType: number; value?: string }[]>((criteria, c) => {
-						const criterium = extensionGalleryManifest.capabilities.extensionQuery.filtering?.find(f => f.name === c.filterType);
-						if (criterium) {
-							criteria.push({
-								filterType: criterium.value,
-								value: c.value,
+					criteria: query.criteria.reduce<{ filterType: number; value?: string }[]>((accumulator, criterium) => {
+						const capability = filteringCapabilities.find(({ name }) => name === criterium.filterType);
+						if (capability) {
+							accumulator.push({
+								filterType: capability.value,
+								value: criterium.value,
 							});
 						}
-						return criteria;
+						return accumulator;
 					}, []),
 					pageNumber: query.pageNumber,
 					pageSize: query.pageSize,
-					sortBy: extensionGalleryManifest.capabilities.extensionQuery.sorting?.find(s => s.name === query.sortBy)?.value,
+					sortBy: sortingCapabilities.find(({ name }) => name === query.sortBy)?.value,
 					sortOrder: query.sortOrder,
 				}
 			],
 			assetTypes: query.assetTypes,
 			flags: query.flags.reduce<number>((flags, flag) => {
-				const flagValue = extensionGalleryManifest.capabilities.extensionQuery.flags?.find(f => f.name === flag);
+				const flagValue = flagCapabilities.find(({ name }) => name === flag);
 				if (flagValue) {
 					flags |= flagValue.value;
 				}

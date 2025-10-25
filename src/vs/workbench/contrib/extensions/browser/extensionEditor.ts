@@ -1070,8 +1070,8 @@ class AdditionalDetailsWidget extends Disposable {
 			const categoriesElement = append(categoriesContainer, $('.categories'));
 			this.extensionGalleryManifestService.getExtensionGalleryManifest()
 				.then(manifest => {
-					const marketplace = getPrimaryExtensionGalleryMarketplace(manifest);
-					const hasCategoryFilter = marketplace?.capabilities.extensionQuery.filtering?.some(({ name }) => name === FilterType.Category);
+						const marketplace = getPrimaryExtensionGalleryMarketplace(manifest);
+						const hasCategoryFilter = marketplace?.capabilities.extensionQuery.filtering?.some(filter => filter.name === FilterType.Category);
 					for (const category of extension.categories) {
 						const categoryElement = append(categoriesElement, $('span.category', { tabindex: '0' }, category));
 						if (hasCategoryFilter) {

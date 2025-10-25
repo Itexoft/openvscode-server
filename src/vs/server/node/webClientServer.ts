@@ -133,6 +133,7 @@ export class WebClientServer {
 	 * @param pathname The pathname of the URL, without base and product path
 	 */
 	async handle(req: http.IncomingMessage, res: http.ServerResponse, parsedUrl: url.UrlWithParsedQuery, pathname: string): Promise<void> {
+		console.log(`[WebClientServer] handle ${req.method} ${pathname} origin=${req.headers.origin ?? ''}`);
 		try {
 			if (pathname.startsWith(STATIC_PATH) && pathname.charCodeAt(STATIC_PATH.length) === CharCode.Slash) {
 				return this._handleStatic(req, res, pathname.substring(STATIC_PATH.length));
@@ -170,6 +171,34 @@ export class WebClientServer {
 		const filePath = join(APP_ROOT, normalizedPathname); // join also normalizes the path
 		if (!isEqualOrParent(filePath, APP_ROOT, !isLinux)) {
 			return serveError(req, res, 400, `Bad request.`);
+		}
+
+		const requestOriginHeader = req.headers.origin;
+		const allowRequestOrigin = typeof requestOriginHeader === 'string' && isAllowedStaticCdnOrigin(requestOriginHeader, this._logService);
+		if (allowRequestOrigin) {
+			headers['Access-Control-Allow-Origin'] = requestOriginHeader;
+			headers['Vary'] = headers['Vary'] ? `${headers['Vary']}, Origin` : 'Origin';
+			console.log(`[WebClientServer] Serving static ${req.method} ${req.url} with CORS origin ${requestOriginHeader}`);
+		}
+
+		if (req.method?.toUpperCase() === 'OPTIONS') {
+			if (!allowRequestOrigin) {
+				res.writeHead(403);
+				return void res.end();
+			}
+			const preflightHeaders: Record<string, string> = Object.create(null);
+			preflightHeaders['Access-Control-Allow-Origin'] = requestOriginHeader!;
+			preflightHeaders['Access-Control-Allow-Private-Network'] = 'true';
+			preflightHeaders['Access-Control-Allow-Methods'] = 'GET, OPTIONS';
+			preflightHeaders['Vary'] = 'Origin';
+			const requestedHeaders = req.headers['access-control-request-headers'];
+			if (typeof requestedHeaders === 'string' && requestedHeaders.length > 0) {
+				preflightHeaders['Access-Control-Allow-Headers'] = requestedHeaders;
+			} else if (Array.isArray(requestedHeaders) && requestedHeaders.length) {
+				preflightHeaders['Access-Control-Allow-Headers'] = requestedHeaders.join(', ');
+			}
+			res.writeHead(204, preflightHeaders);
+			return void res.end();
 		}
 
 		return serveFile(filePath, this._environmentService.isBuilt ? CacheControl.NO_EXPIRY : CacheControl.ETAG, this._logService, req, res, headers);
@@ -557,5 +586,19 @@ export class WebClientServer {
 			'Content-Security-Policy': cspDirectives
 		});
 		return void res.end(data);
+	}
+
+}
+
+function isAllowedStaticCdnOrigin(origin: string, logService: ILogService): boolean {
+	try {
+		const parsed = new URL(origin);
+		if (parsed.protocol !== 'https:') {
+			return false;
+		}
+		return parsed.hostname.endsWith('.vscode-cdn.net');
+	} catch (error) {
+		logService.trace(`[WebClientServer] Ignoring invalid static origin "${origin}": ${error instanceof Error ? error.message : String(error)}`);
+		return false;
 	}
 }

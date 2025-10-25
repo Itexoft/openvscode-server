@@ -16,7 +16,7 @@ import { ExtensionType, IExtension, IExtensionManifest, TargetPlatform } from '.
 import { FileOperationError, FileOperationResult, IFileService, IFileStat } from '../../files/common/files.js';
 import { createDecorator } from '../../instantiation/common/instantiation.js';
 import { Registry } from '../../registry/common/platform.js';
-import { IExtensionGalleryManifest } from './extensionGalleryManifest.js';
+import { IExtensionGalleryMarketplace } from './extensionGalleryManifest.js';
 
 export const EXTENSION_IDENTIFIER_PATTERN = '^([a-z0-9A-Z][a-z0-9-A-Z]*)\\.([a-z0-9A-Z][a-z0-9-A-Z]*)$';
 export const EXTENSION_IDENTIFIER_REGEX = new RegExp(EXTENSION_IDENTIFIER_PATTERN);
@@ -784,10 +784,12 @@ Registry.as<IConfigurationRegistry>(Extensions.Configuration)
 		}
 	});
 
-export function shouldRequireRepositorySignatureFor(isPrivate: boolean, galleryManifest: IExtensionGalleryManifest | null): boolean {
-	if (isPrivate) {
-		return galleryManifest?.capabilities.signing?.allPrivateRepositorySigned === true;
+export function shouldRequireRepositorySignatureFor(isPrivate: boolean, marketplace: IExtensionGalleryMarketplace | null | undefined): boolean {
+	if (!marketplace) {
+		return false;
 	}
-	return galleryManifest?.capabilities.signing?.allPublicRepositorySigned === true;
+	if (isPrivate) {
+		return marketplace.capabilities.signing?.allPrivateRepositorySigned === true;
+	}
+	return marketplace.capabilities.signing?.allPublicRepositorySigned === true;
 }
-

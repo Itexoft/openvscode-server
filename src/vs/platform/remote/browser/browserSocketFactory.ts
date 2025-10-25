@@ -269,6 +269,7 @@ class BrowserSocket implements ISocket {
 export class BrowserSocketFactory implements ISocketFactory<RemoteConnectionType.WebSocket> {
 
 	private readonly _webSocketFactory: IWebSocketFactory;
+	private readonly _readinessPromises = new Map<string, Promise<void>>();
 
 	constructor(webSocketFactory: IWebSocketFactory | null | undefined) {
 		this._webSocketFactory = webSocketFactory || defaultWebSocketFactory;
@@ -281,12 +282,71 @@ export class BrowserSocketFactory implements ISocketFactory<RemoteConnectionType
 	connect({ host, port }: WebSocketRemoteConnection, path: string, query: string, debugLabel: string): Promise<ISocket> {
 		return new Promise<ISocket>((resolve, reject) => {
 			const webSocketSchema = (/^https:/.test(mainWindow.location.href) ? 'wss' : 'ws');
-			const socket = this._webSocketFactory.create(`${webSocketSchema}://${(/:/.test(host) && !/\[/.test(host)) ? `[${host}]` : host}:${port}${path}?${query}&skipWebSocketFrames=false`, debugLabel);
+			const authority = ((/:/.test(host) && !/\[/.test(host)) ? `[${host}]` : host);
+		const normalizedPath = path.endsWith('/') ? path : `${path}/`;
+		const url = `${webSocketSchema}://${authority}:${port}${normalizedPath}?${query}&skipWebSocketFrames=false`;
+		const readinessKey = `${authority}:${port}${normalizedPath}`;
+		const readinessPromise = this._getReadinessPromise(webSocketSchema === 'wss' ? 'https' : 'http', authority, port, normalizedPath, readinessKey);
+
+		mainWindow.console?.info?.(`[remote-connection] patched BrowserSocketFactory.connect waiting on ${readinessKey}`);
+
+		readinessPromise.then(() => {
+			const socket = this._webSocketFactory.create(url, debugLabel);
 			const errorListener = socket.onError(reject);
 			socket.onOpen(() => {
 				errorListener.dispose();
-				resolve(new BrowserSocket(socket, debugLabel));
-			});
+					resolve(new BrowserSocket(socket, debugLabel));
+				});
+			}).catch(reject);
 		});
+	}
+
+	private _getReadinessPromise(httpSchema: 'http' | 'https', authority: string, port: number, normalizedPath: string, key: string): Promise<void> {
+		let promise = this._readinessPromises.get(key);
+		if (!promise) {
+			promise = this._waitForServerReady(httpSchema, authority, port, normalizedPath);
+			this._readinessPromises.set(key, promise);
+			// Once the promise settles, drop it from the cache so future reconnects can validate again if needed
+			promise.finally(() => this._readinessPromises.delete(key));
+		}
+		return promise;
+	}
+
+	private async _waitForServerReady(httpSchema: 'http' | 'https', authority: string, port: number, normalizedPath: string): Promise<void> {
+		const readinessUrl = `${httpSchema}://${authority}:${port}${normalizedPath}version`;
+		const delayMillis = 500;
+		const logEvery = 10;
+		const startedAt = Date.now();
+		let attempt = 0;
+		let lastStatus: number | undefined;
+		let lastErrorMessage: string | undefined;
+
+		mainWindow.console?.info?.(`[remote-connection] probing backend readiness via ${readinessUrl}`);
+
+		while (true) {
+			try {
+				const response = await fetch(`${readinessUrl}?t=${Date.now()}`, { method: 'GET', cache: 'no-store', credentials: 'same-origin' });
+				lastStatus = response.status;
+				if (response.ok) {
+					if (attempt > 0) {
+						const elapsedSeconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+						mainWindow.console?.info?.(`[remote-connection] backend ready after ${attempt + 1} attempt(s), ${elapsedSeconds}s elapsed`);
+					}
+					return;
+				}
+			} catch (error) {
+				lastErrorMessage = error instanceof Error ? error.message : String(error);
+			}
+
+			attempt++;
+			if (attempt % logEvery === 0) {
+				const elapsedSeconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+				const statusInfo = typeof lastStatus === 'number' ? `last status ${lastStatus}` : 'no response';
+				const errorSuffix = lastErrorMessage ? `, last error: ${lastErrorMessage}` : '';
+				mainWindow.console?.info?.(`[remote-connection] waiting for backend readiness (${attempt} attempts, ${elapsedSeconds}s elapsed, ${statusInfo}${errorSuffix})`);
+			}
+
+			await new Promise(resolve => mainWindow.setTimeout(resolve, delayMillis));
+		}
 	}
 }
