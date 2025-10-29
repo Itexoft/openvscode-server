@@ -25,6 +25,8 @@ let outerIframeMessagePort;
  * Origin used for resources
  */
 const resourceBaseAuthority = searchParams.get('vscode-resource-base-authority');
+const FALLBACK_RESOURCE_SCHEME = 'https';
+const resourceBaseScheme = (searchParams.get('vscode-resource-base-scheme') ?? FALLBACK_RESOURCE_SCHEME).toLowerCase() || FALLBACK_RESOURCE_SCHEME;
 
 /**
  * @param {string} name
@@ -179,7 +181,7 @@ sw.addEventListener('message', async (event) => {
 
 sw.addEventListener('fetch', (event) => {
 	const requestUrl = new URL(event.request.url);
-	if (typeof resourceBaseAuthority === 'string' && requestUrl.protocol === 'https:' && requestUrl.hostname.endsWith('.' + resourceBaseAuthority)) {
+	if (typeof resourceBaseAuthority === 'string' && resourceBaseAuthority.length > 0 && requestUrl.protocol === `${resourceBaseScheme}:` && requestUrl.hostname.endsWith('.' + resourceBaseAuthority)) {
 		switch (event.request.method) {
 			case 'GET':
 			case 'HEAD': {

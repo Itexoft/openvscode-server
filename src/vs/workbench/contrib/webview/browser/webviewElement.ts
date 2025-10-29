@@ -32,7 +32,7 @@ import { IRemoteAuthorityResolverService } from '../../../../platform/remote/com
 import { ITunnelService } from '../../../../platform/tunnel/common/tunnel.js';
 import { WebviewPortMappingManager } from '../../../../platform/webview/common/webviewPortMapping.js';
 import { IWorkbenchEnvironmentService } from '../../../services/environment/common/environmentService.js';
-import { decodeAuthority, webviewGenericCspSource, webviewRootResourceAuthority } from '../common/webview.js';
+import { decodeAuthority, webviewGenericCspSource, webviewResourceBaseScheme, webviewRootResourceAuthority } from '../common/webview.js';
 import { loadLocalResource, WebviewResourceResponse } from './resourceLoading.js';
 import { WebviewThemeDataProvider } from './themeing.js';
 import { areWebviewContentOptionsEqual, IWebviewElement, WebviewContentOptions, WebviewExtensionDescription, WebviewInitInfo, WebviewMessageReceivedEvent, WebviewOptions } from './webview.js';
@@ -429,6 +429,7 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 			extensionId: extension?.id.value ?? '',
 			platform: this.platform,
 			'vscode-resource-base-authority': webviewRootResourceAuthority,
+			'vscode-resource-base-scheme': webviewResourceBaseScheme,
 			parentOrigin: targetWindow.origin,
 		};
 

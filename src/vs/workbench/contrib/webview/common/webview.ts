@@ -6,23 +6,127 @@
 import { CharCode } from '../../../../base/common/charCode.js';
 import { Schemas } from '../../../../base/common/network.js';
 import { URI } from '../../../../base/common/uri.js';
+import product from '../../../../platform/product/common/product.js';
 
 export interface WebviewRemoteInfo {
 	readonly isRemote: boolean;
 	readonly authority: string | undefined;
 }
 
+const FALLBACK_RESOURCE_HOST = 'vscode-cdn.net';
+const FALLBACK_RESOURCE_SCHEME = 'https';
+const FALLBACK_COMMIT = 'ef65ac1ba57f57f2a3961bfe94aa20481caca4c6';
+const FALLBACK_QUALITY = 'insider';
+const UUID_TOKEN = '{{uuid}}';
+const COMMIT_TOKEN = '{{commit}}';
+const QUALITY_TOKEN = '{{quality}}';
+const UUID_PLACEHOLDER = '00000000000000000000000000000000';
+
+function replaceAll(input: string, search: string, replacement: string): string {
+	if (!search || search === replacement) {
+		return input;
+	}
+
+	return input.split(search).join(replacement);
+}
+
+function stripUuidPlaceholder(authority: string): string {
+	if (authority.startsWith(`${UUID_PLACEHOLDER}.`)) {
+		return authority.slice(UUID_PLACEHOLDER.length + 1);
+	}
+
+	return authority.replace(UUID_PLACEHOLDER, '').replace(/^\./, '');
+}
+
+function computeWebviewResourceConfiguration(): {
+	readonly baseHost: string;
+	readonly rootResourceAuthority: string;
+	readonly resourceAuthorityPort: string | undefined;
+	readonly resourceScheme: string;
+	readonly genericCspSource: string;
+} {
+	let template = product.webviewContentExternalBaseUrlTemplate;
+
+	if (!template) {
+		return {
+			baseHost: FALLBACK_RESOURCE_HOST,
+			rootResourceAuthority: `vscode-resource.${FALLBACK_RESOURCE_HOST}`,
+			resourceAuthorityPort: undefined,
+			resourceScheme: FALLBACK_RESOURCE_SCHEME,
+			genericCspSource: `'self' ${FALLBACK_RESOURCE_SCHEME}://*.${FALLBACK_RESOURCE_HOST}`
+		};
+	}
+
+	template = replaceAll(template, COMMIT_TOKEN, product.commit ?? FALLBACK_COMMIT);
+	template = replaceAll(template, QUALITY_TOKEN, product.quality ?? FALLBACK_QUALITY);
+
+	const hasUuidToken = template.includes(UUID_TOKEN);
+	const parseTarget = hasUuidToken ? template.replace(UUID_TOKEN, UUID_PLACEHOLDER) : template;
+
+	try {
+		const endpoint = new URL(parseTarget);
+		let hostname = endpoint.hostname;
+		if (!hostname) {
+			throw new Error('Missing hostname');
+		}
+
+		let hostWithPort = endpoint.host || hostname;
+		let resourceScheme = (endpoint.protocol || '').replace(/:$/, '').toLowerCase() || FALLBACK_RESOURCE_SCHEME;
+		let resourceAuthorityPort = endpoint.port || undefined;
+
+		const isLoopback = hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '[::1]';
+		if (isLoopback && typeof globalThis !== 'undefined') {
+			const location = (globalThis as any)?.location;
+			if (location?.host) {
+				const locationHost: string = location.host;
+				const locationHostname: string = location.hostname || locationHost;
+				hostWithPort = locationHost;
+				hostname = locationHostname;
+				resourceAuthorityPort = location.port || undefined;
+				const protocol = typeof location.protocol === 'string' ? location.protocol.replace(/:$/, '') : undefined;
+				if (protocol) {
+					resourceScheme = protocol.toLowerCase();
+				}
+			}
+		}
+
+		const baseHost = hasUuidToken ? stripUuidPlaceholder(hostWithPort) : hostWithPort;
+		const baseHostname = hasUuidToken ? stripUuidPlaceholder(hostname) : hostname;
+		const cspAuthority = hasUuidToken ? `*.${baseHostname}` : hostWithPort;
+
+		return {
+			baseHost,
+			rootResourceAuthority: `vscode-resource.${baseHostname}`,
+			resourceAuthorityPort,
+			resourceScheme,
+			genericCspSource: `'self' ${resourceScheme}://${cspAuthority}`
+		};
+	} catch (error) {
+		return {
+			baseHost: FALLBACK_RESOURCE_HOST,
+			rootResourceAuthority: `vscode-resource.${FALLBACK_RESOURCE_HOST}`,
+			resourceAuthorityPort: undefined,
+			resourceScheme: FALLBACK_RESOURCE_SCHEME,
+			genericCspSource: `'self' ${FALLBACK_RESOURCE_SCHEME}://*.${FALLBACK_RESOURCE_HOST}`
+		};
+	}
+}
+
+const webviewResourceConfiguration = computeWebviewResourceConfiguration();
+
 /**
  * Root from which resources in webviews are loaded.
  *
- * This is hardcoded because we never expect to actually hit it. Instead these requests
- * should always go to a service worker.
+ * This is configurable because self-hosted environments often need to serve the webview
+ * bundle from a custom origin instead of the default CDN.
  */
-export const webviewResourceBaseHost = 'vscode-cdn.net';
+export const webviewResourceBaseHost = webviewResourceConfiguration.baseHost;
 
-export const webviewRootResourceAuthority = `vscode-resource.${webviewResourceBaseHost}`;
+export const webviewRootResourceAuthority = webviewResourceConfiguration.rootResourceAuthority;
 
-export const webviewGenericCspSource = `'self' https://*.${webviewResourceBaseHost}`;
+export const webviewResourceBaseScheme = webviewResourceConfiguration.resourceScheme;
+
+export const webviewGenericCspSource = webviewResourceConfiguration.genericCspSource;
 
 /**
  * Construct a uri that can load resources inside a webview
@@ -50,9 +154,14 @@ export function asWebviewUri(resource: URI, remoteInfo?: WebviewRemoteInfo): URI
 		});
 	}
 
+	const resourceHost = `${resource.scheme}+${encodeAuthority(resource.authority)}.${webviewRootResourceAuthority}`;
+	const authority = webviewResourceConfiguration.resourceAuthorityPort
+		? `${resourceHost}:${webviewResourceConfiguration.resourceAuthorityPort}`
+		: resourceHost;
+
 	return URI.from({
-		scheme: Schemas.https,
-		authority: `${resource.scheme}+${encodeAuthority(resource.authority)}.${webviewRootResourceAuthority}`,
+		scheme: webviewResourceConfiguration.resourceScheme,
+		authority,
 		path: resource.path,
 		fragment: resource.fragment,
 		query: resource.query,

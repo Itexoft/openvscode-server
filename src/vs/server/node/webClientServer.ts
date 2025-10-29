@@ -321,6 +321,17 @@ export class WebClientServer {
 			return false;
 		};
 
+		const getProtocol = () => {
+			const forwardedProto = getFirstHeader('x-forwarded-proto');
+			if (forwardedProto) {
+				return forwardedProto.split(',')[0]?.trim().toLowerCase() === 'https' ? 'https' : 'http';
+			}
+
+			// Node's IncomingMessage doesn't guarantee socket to be TLSSocket, so we use type assertion.
+			const socket: any = req.socket;
+			return socket?.encrypted ? 'https' : 'http';
+		};
+
 		// Prefix routes with basePath for clients
 		const basePath = getFirstHeader('x-forwarded-prefix') || this._basePath;
 
@@ -390,6 +401,8 @@ export class WebClientServer {
 				return JSON.stringify(value).replace(/"/g, '&quot;');
 			}
 
+		const protocol = getProtocol();
+
 		let _wrapWebWorkerExtHostInIframe: undefined | false = undefined;
 		if (this._environmentService.args['enable-smoke-test-driver']) {
 			// integration tests run at a time when the built output is not yet published to the CDN
@@ -424,16 +437,10 @@ export class WebClientServer {
 			scopes: [['user:email'], ['repo']]
 		} : undefined;
 
+		const webviewEndpoint = `${protocol}://${remoteAuthority}${staticRoute}/out/vs/workbench/contrib/webview/browser/pre/`;
+
 		const productConfiguration: Partial<Mutable<IProductConfiguration>> = {
-			// embedderIdentifier: 'server-distro',
-			// extensionsGallery: this._webExtensionResourceUrlTemplate && this._productService.extensionsGallery ? {
-			// 	...this._productService.extensionsGallery,
-			// 	resourceUrlTemplate: this._webExtensionResourceUrlTemplate.with({
-			// 		scheme: 'http',
-			// 		authority: remoteAuthority,
-			// 		path: `${webExtensionRoute}/${this._webExtensionResourceUrlTemplate.authority}${this._webExtensionResourceUrlTemplate.path}`
-			// 	}).toString(true)
-			// } : undefined
+			webviewContentExternalBaseUrlTemplate: webviewEndpoint
 		};
 
 		const proposedApi = this._environmentService.args['enable-proposed-api'];
@@ -459,6 +466,7 @@ export class WebClientServer {
 			folderUri: resolveWorkspaceURI(this._environmentService.args['default-folder']),
 			workspaceUri: resolveWorkspaceURI(this._environmentService.args['default-workspace']),
 			productConfiguration,
+			webviewEndpoint,
 			callbackRoute: callbackRoute
 		};
 
@@ -515,9 +523,9 @@ export class WebClientServer {
 			'default-src \'self\';',
 			'img-src \'self\' https: data: blob:;',
 			'media-src \'self\';',
-			`script-src 'self' 'unsafe-eval' ${WORKBENCH_NLS_BASE_URL ?? ''} blob: 'nonce-1nline-m4p' ${this._getScriptCspHashes(data).join(' ')} '${webWorkerExtensionHostIframeScriptSHA}' 'sha256-/r7rqQ+yrxt57sxLuQ6AMYcy/lUpvAIzHjIJt/OeLWU=' ${useTestResolver ? '' : `http://${remoteAuthority}`};`,  // the sha is the same as in src/vs/workbench/services/extensions/worker/webWorkerExtensionHostIframe.html
+			`script-src 'self' 'unsafe-eval' ${WORKBENCH_NLS_BASE_URL ?? ''} blob: 'nonce-1nline-m4p' ${this._getScriptCspHashes(data).join(' ')} '${webWorkerExtensionHostIframeScriptSHA}' 'sha256-/r7rqQ+yrxt57sxLuQ6AMYcy/lUpvAIzHjIJt/OeLWU=' ${useTestResolver ? '' : `${protocol}://${remoteAuthority}`};`,  // the sha is the same as in src/vs/workbench/services/extensions/worker/webWorkerExtensionHostIframe.html
 			'child-src \'self\';',
-			`frame-src 'self' https://*.vscode-cdn.net data:;`,
+			`frame-src 'self' ${protocol}://${remoteAuthority} https://*.vscode-cdn.net data:;`,
 			'worker-src \'self\' data: blob:;',
 			'style-src \'self\' \'unsafe-inline\';',
 			'connect-src \'self\' ws: wss: https:;',
