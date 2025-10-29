@@ -27,6 +27,7 @@ import { ExtensionIdentifier } from '../../../../platform/extensions/common/exte
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
+import { IProductService } from '../../../../platform/product/common/productService.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { IRemoteAuthorityResolverService } from '../../../../platform/remote/common/remoteAuthorityResolver.js';
 import { ITunnelService } from '../../../../platform/tunnel/common/tunnel.js';
@@ -96,7 +97,7 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 
 	protected get platform(): string { return 'browser'; }
 
-	private readonly _expectedServiceWorkerVersion = 4; // Keep this in sync with the version in service-worker.js
+	private readonly _expectedServiceWorkerVersion: string;
 
 	private _element: HTMLIFrameElement | undefined;
 	protected get element(): HTMLIFrameElement | undefined { return this._element; }
@@ -162,9 +163,14 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 		@IRemoteAuthorityResolverService private readonly _remoteAuthorityResolverService: IRemoteAuthorityResolverService,
 		@ITunnelService private readonly _tunnelService: ITunnelService,
 		@IInstantiationService instantiationService: IInstantiationService,
+		@IProductService productService: IProductService,
 		@IAccessibilityService private readonly _accessibilityService: IAccessibilityService,
 	) {
 		super();
+
+		const candidateServiceWorkerVersion = this._environmentService.webviewServiceWorkerVersion ?? productService.webviewServiceWorkerVersion;
+		this._expectedServiceWorkerVersion = candidateServiceWorkerVersion && candidateServiceWorkerVersion.length > 8 ? candidateServiceWorkerVersion : 'auto';
+		(globalThis as any).__openvscodeLastWebviewSwVersion = this._expectedServiceWorkerVersion;
 
 		this.providedViewType = initInfo.providedViewType;
 		this.origin = initInfo.origin ?? this.id;
@@ -425,7 +431,7 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 			id: this.id,
 			parentId: targetWindow.vscodeWindowId.toString(),
 			origin: this.origin,
-			swVersion: String(this._expectedServiceWorkerVersion),
+			swVersion: this._expectedServiceWorkerVersion,
 			extensionId: extension?.id.value ?? '',
 			platform: this.platform,
 			'vscode-resource-base-authority': webviewRootResourceAuthority,

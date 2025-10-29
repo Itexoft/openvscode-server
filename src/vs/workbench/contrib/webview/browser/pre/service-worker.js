@@ -8,7 +8,8 @@
 /** @type {ServiceWorkerGlobalScope} */
 const sw = /** @type {any} */ (self);
 
-const VERSION = 4;
+const scriptUrl = new URL(sw.location.href);
+const VERSION = scriptUrl.searchParams.get('v') ?? '0';
 
 const resourceCacheName = `vscode-resource-cache-${VERSION}`;
 

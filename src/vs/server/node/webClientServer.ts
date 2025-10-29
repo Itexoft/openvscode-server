@@ -111,6 +111,7 @@ const WEB_EXTENSION_PATH = `/web-extension-resource`;
 export class WebClientServer {
 
 	private readonly _webExtensionResourceUrlTemplate: URI | undefined;
+	private _webviewServiceWorkerVersionPromise: Promise<string> | undefined;
 
 	constructor(
 		private readonly _connectionToken: ServerConnectionToken,
@@ -439,8 +440,11 @@ export class WebClientServer {
 
 		const webviewEndpoint = `${protocol}://${remoteAuthority}${staticRoute}/out/vs/workbench/contrib/webview/browser/pre/`;
 
+		const webviewServiceWorkerVersion = await this._resolveWebviewServiceWorkerVersion();
+
 		const productConfiguration: Partial<Mutable<IProductConfiguration>> = {
-			webviewContentExternalBaseUrlTemplate: webviewEndpoint
+			webviewContentExternalBaseUrlTemplate: webviewEndpoint,
+			webviewServiceWorkerVersion
 		};
 
 		const proposedApi = this._environmentService.args['enable-proposed-api'];
@@ -467,6 +471,7 @@ export class WebClientServer {
 			workspaceUri: resolveWorkspaceURI(this._environmentService.args['default-workspace']),
 			productConfiguration,
 			webviewEndpoint,
+			webviewServiceWorkerVersion,
 			callbackRoute: callbackRoute
 		};
 
@@ -553,6 +558,23 @@ export class WebClientServer {
 
 		res.writeHead(200, headers);
 		return void res.end(data);
+	}
+
+	private async _resolveWebviewServiceWorkerVersion(): Promise<string> {
+		if (!this._webviewServiceWorkerVersionPromise) {
+			this._webviewServiceWorkerVersionPromise = (async () => {
+				try {
+					const serviceWorkerPath = join(APP_ROOT, 'static', 'out', 'vs', 'workbench', 'contrib', 'webview', 'browser', 'pre', 'service-worker.js');
+					const content = await promises.readFile(serviceWorkerPath);
+					return crypto.createHash('sha256').update(content).digest('hex');
+				} catch (error) {
+					this._logService.error(`[WebClientServer] Failed to compute webview service worker version: ${error instanceof Error ? error.message : String(error)}`);
+					return this._productService.commit ?? Date.now().toString();
+				}
+			})();
+		}
+
+		return this._webviewServiceWorkerVersionPromise;
 	}
 
 	private _getScriptCspHashes(content: string): string[] {

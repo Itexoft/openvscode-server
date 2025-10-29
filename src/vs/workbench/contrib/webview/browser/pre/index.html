@@ -5,7 +5,7 @@
 	<meta charset="UTF-8">
 
 	<meta http-equiv="Content-Security-Policy"
-		content="default-src 'none'; script-src 'sha256-ZcIhtIuU4M9PbKfs7w/CLqHimFJRK8L7mYTXOfiUv0I=' 'self'; frame-src 'self'; style-src 'unsafe-inline';">
+		content="default-src 'none'; script-src 'sha256-ZcIhtIuU4M9PbKfs7w/CLqHimFJRK8L7mYTXOfiUv0I=' 'sha256-iRxcNtjPoicNtKBpJCPRJvA2szPZpdEg8bPh12n1emg=' 'self'; connect-src 'self' https: http:; worker-src 'self'; frame-src 'self'; style-src 'unsafe-inline';">
 
 	<!-- Disable pinch zooming -->
 	<meta name="viewport"
@@ -34,7 +34,27 @@
 		const webviewOrigin = searchParams.get('origin');
 		const onElectron = searchParams.get('platform') === 'electron';
 		const disableServiceWorker = searchParams.has('disableServiceWorker');
-		const expectedWorkerVersion = parseInt(searchParams.get('swVersion'));
+		let expectedWorkerVersion = searchParams.get('swVersion') ?? '0';
+
+		try {
+			const swUrl = new URL('service-worker.js', location.toString());
+			const swResponse = await fetch(swUrl.toString(), { cache: 'no-cache' });
+			if (!swResponse.ok) {
+				throw new Error(`Failed to fetch service worker script: ${swResponse.status}`);
+			}
+			const swSource = await swResponse.arrayBuffer();
+			const hashBuffer = await crypto.subtle.digest('SHA-256', swSource);
+			const hashArray = Array.from(new Uint8Array(hashBuffer));
+			expectedWorkerVersion = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+		} catch (error) {
+			console.error('Could not compute service worker version', error);
+			if (expectedWorkerVersion === 'auto' || expectedWorkerVersion === '0') {
+				expectedWorkerVersion = Date.now().toString();
+			}
+		}
+
+		globalThis.__webviewComputedServiceWorkerVersion = expectedWorkerVersion;
+
 
 		/**
 		 * @param {string} name
@@ -255,7 +275,13 @@
 				return reject(new Error('Service Workers are not enabled. Webviews will not work. Try disabling private/incognito mode.'));
 			}
 
-			const swPath = encodeURI(`service-worker.js?v=${expectedWorkerVersion}&vscode-resource-base-authority=${searchParams.get('vscode-resource-base-authority') ?? ''}&vscode-resource-base-scheme=${searchParams.get('vscode-resource-base-scheme') ?? ''}&remoteAuthority=${searchParams.get('remoteAuthority') ?? ''}`);
+			const swQuery = new URLSearchParams({
+				v: expectedWorkerVersion,
+				'vscode-resource-base-authority': searchParams.get('vscode-resource-base-authority') ?? '',
+				'vscode-resource-base-scheme': searchParams.get('vscode-resource-base-scheme') ?? '',
+				remoteAuthority: searchParams.get('remoteAuthority') ?? ''
+			});
+			const swPath = `service-worker.js?${swQuery.toString()}`;
 			navigator.serviceWorker.register(swPath, { type: 'module' })
 				.then(async registration => {
 					/**
@@ -367,8 +393,9 @@
 				};
 
 				const parentOrigin = searchParams.get('parentOrigin');
-
 				const hostname = location.hostname;
+				const remoteAuthority = searchParams.get('remoteAuthority');
+				const remoteAuthorityHost = remoteAuthority ? remoteAuthority.split(':')[0] : undefined;
 
 				if (!crypto.subtle) {
 					// cannot validate, not running in a secure context
@@ -393,6 +420,10 @@
 
 				if (hostname === parentOriginHash || hostname.startsWith(parentOriginHash + '.')) {
 					// validation succeeded!
+					return start(parentOrigin);
+				}
+
+				if (remoteAuthorityHost && hostname === remoteAuthorityHost) {
 					return start(parentOrigin);
 				}
 

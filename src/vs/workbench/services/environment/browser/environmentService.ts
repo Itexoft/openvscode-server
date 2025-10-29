@@ -231,6 +231,11 @@ export class BrowserWorkbenchEnvironmentService implements IBrowserWorkbenchEnvi
 	}
 
 	@memoize
+	get webviewServiceWorkerVersion(): string | undefined {
+		return this.options.webviewServiceWorkerVersion ?? this.productService.webviewServiceWorkerVersion;
+	}
+
+	@memoize
 	get extensionTelemetryLogResource(): URI { return joinPath(this.logsHome, 'extensionTelemetry.log'); }
 
 	@memoize
