@@ -277,6 +277,13 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 
 		this._register(this.on('load-resource', async (entry) => {
 			try {
+				console.log('[WebviewHost] load-resource', {
+					id: entry.id,
+					scheme: entry.scheme,
+					authority: entry.authority,
+					path: entry.path,
+					query: entry.query
+				});
 				// Restore the authority we previously encoded
 				const authority = decodeAuthority(entry.authority);
 				const uri = URI.from({
@@ -766,6 +773,7 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 
 	private async loadResource(id: number, uri: URI, ifNoneMatch: string | undefined) {
 		try {
+			console.log('[WebviewHost] localResourceRoots', this._content.options.localResourceRoots?.map(root => root.toString(true)));
 			const result = await loadLocalResource(uri, {
 				ifNoneMatch,
 				roots: this._content.options.localResourceRoots || [],

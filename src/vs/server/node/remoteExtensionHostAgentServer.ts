@@ -127,9 +127,14 @@ class RemoteExtensionHostAgentServer extends Disposable implements IServerAPI {
 			if (this._serverBasePath !== undefined && pathname.startsWith(this._serverBasePath)) {
 				pathname = pathname.substring(this._serverBasePath.length) || '/';
 			}
-			// for now accept all paths, with or without server product path
+		// for now accept all paths, with or without server product path
 			if (pathname.startsWith(this._serverProductPath) && pathname.charCodeAt(this._serverProductPath.length) === CharCode.Slash) {
 				pathname = pathname.substring(this._serverProductPath.length);
+			}
+
+			if (pathname.startsWith('/oss-')) {
+				const idx = pathname.indexOf('/', 5);
+				pathname = idx !== -1 ? (pathname.substring(idx) || '/') : '/';
 			}
 
 			if (isOptions) {

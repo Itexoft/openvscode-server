@@ -29,6 +29,14 @@ const resourceBaseAuthority = searchParams.get('vscode-resource-base-authority')
 const FALLBACK_RESOURCE_SCHEME = 'https';
 const resourceBaseScheme = (searchParams.get('vscode-resource-base-scheme') ?? FALLBACK_RESOURCE_SCHEME).toLowerCase() || FALLBACK_RESOURCE_SCHEME;
 
+const log = (...args) => {
+	try {
+		console.log('[WebviewSW]', ...args);
+	} catch (error) {
+		// ignore logging failures (e.g. console not available)
+	}
+};
+
 /**
  * @param {string} name
  * @param {Record<string, string>} [options]
@@ -42,9 +50,95 @@ const perfMark = (name, options = {}) => {
 }
 
 perfMark('scriptStart');
+log('script start', { version: VERSION, scope: sw.registration?.scope });
 
 /** @type {number} */
 const resolveTimeout = 30_000;
+
+const decodeComponentMulti = (value) => {
+	let result = value;
+	for (let i = 0; i < 3; i++) {
+		try {
+			const decoded = decodeURIComponent(result);
+			if (decoded === result) {
+				break;
+			}
+			result = decoded;
+		} catch {
+			break;
+		}
+	}
+	return result;
+};
+
+const decodeAuthoritySegment = (value) => {
+	return decodeComponentMulti(value.replace(/-([0-9a-fA-F]{4})/g, (_, hex) => {
+		try {
+			return String.fromCharCode(parseInt(hex, 16));
+		} catch {
+			return `-${hex}`;
+		}
+	}));
+};
+
+const parseEncodedBaseHref = (encoded) => {
+	const decoded = decodeComponentMulti(encoded);
+	const matches = decoded.match(/^([a-zA-Z0-9+\-.]+):\/\/([^/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/);
+	if (!matches) {
+		return undefined;
+	}
+
+	const originalScheme = matches[1];
+	const rawHost = decodeAuthoritySegment(matches[2]);
+	let path = decodeComponentMulti(matches[3] ?? '/');
+	if (!path.length || !path.startsWith('/')) {
+		path = `/${path}`;
+	}
+	const query = matches[4] ? decodeComponentMulti(matches[4].slice(1)) : '';
+
+	let scheme = originalScheme;
+	let authority = rawHost;
+
+	const marker = '.vscode-resource.';
+	const lowerHost = rawHost.toLowerCase();
+	const markerIndex = lowerHost.indexOf(marker);
+	if (markerIndex >= 0) {
+		const prefix = rawHost.slice(0, markerIndex);
+		const plusIndex = prefix.indexOf('+');
+		if (plusIndex >= 0) {
+			scheme = prefix.slice(0, plusIndex);
+			const encodedAuthority = prefix.slice(plusIndex + 1);
+			authority = decodeAuthoritySegment(encodedAuthority);
+		} else if (prefix === 'file') {
+			scheme = 'file';
+			authority = '';
+		}
+	} else if (lowerHost.startsWith('file+vscode-resource')) {
+		scheme = 'file';
+		authority = '';
+	} else if (lowerHost.startsWith('vscode-resource')) {
+		scheme = 'file';
+		authority = '';
+	}
+
+	return { scheme, authority, path, query };
+};
+
+const resolveResourceSegment = (basePath, resourceSegment) => {
+	try {
+		const baseForResolution = new URL(basePath || '/', 'http://placeholder');
+		const resolved = new URL(resourceSegment || '.', baseForResolution);
+		return {
+			path: resolved.pathname,
+			query: resolved.search.replace(/^\?/, ''),
+		};
+	} catch {
+		return {
+			path: resourceSegment || '/',
+			query: '',
+		};
+	}
+};
 
 
 /**
@@ -143,6 +237,7 @@ sw.addEventListener('message', async (event) => {
 
 	/** @type {Client} */
 	const source = event.source;
+	log('message event', { channel: event.data?.channel, clientId: source.id });
 	switch (event.data.channel) {
 		case 'version': {
 			perfMark('version/request');
@@ -155,6 +250,7 @@ sw.addEventListener('message', async (event) => {
 						version: VERSION
 					});
 				}
+				log('message:version -> replied', { clientFound: !!client });
 			});
 			return;
 		}
@@ -164,6 +260,7 @@ sw.addEventListener('message', async (event) => {
 			if (!resourceRequestStore.resolve(response.id, response)) {
 				console.log('Could not resolve unknown resource', response.path);
 			}
+			log('message:did-load-resource', { id: response.id, path: response.path, status: response.status });
 			return;
 		}
 		case 'did-load-localhost': {
@@ -171,9 +268,11 @@ sw.addEventListener('message', async (event) => {
 			if (!localhostRequestStore.resolve(data.id, data.location)) {
 				console.log('Could not resolve unknown localhost', data.origin);
 			}
+			log('message:did-load-localhost', { id: data.id, origin: data.origin, location: data.location });
 			return;
 		}
 		default: {
+			log('message:unknown-channel', event.data);
 			console.log('Unknown message');
 			return;
 		}
@@ -182,6 +281,55 @@ sw.addEventListener('message', async (event) => {
 
 sw.addEventListener('fetch', (event) => {
 	const requestUrl = new URL(event.request.url);
+	log('fetch event', { url: requestUrl.toString() });
+
+	const sameOriginResourcePrefix = `${rootPath}/resource/`;
+	if (requestUrl.origin === sw.origin && requestUrl.pathname.startsWith(sameOriginResourcePrefix)) {
+		log('resource fetch candidate', { pathname: requestUrl.pathname });
+		const remainder = requestUrl.pathname.slice(sameOriginResourcePrefix.length);
+		const firstSlash = remainder.indexOf('/');
+		if (firstSlash > 0) {
+			const encodedBase = remainder.slice(0, firstSlash);
+			const resourceSegmentRaw = remainder.slice(firstSlash + 1);
+
+			try {
+				const baseInfo = parseEncodedBaseHref(encodedBase);
+				if (!baseInfo) {
+					log('failed to parse resource base href', { encodedBase });
+					return event.respondWith(fetch(event.request));
+				}
+				log('parsed base href', { base: baseInfo, resourceSegmentRaw });
+
+				const resourceSegment = decodeComponentMulti(resourceSegmentRaw);
+				const resolved = resolveResourceSegment(baseInfo.path, resourceSegment);
+
+				const combinedQuery = resolved.query
+					|| baseInfo.query
+					|| requestUrl.search.replace(/^\?/, '');
+
+				log('same-origin resource proxy', {
+					request: requestUrl.toString(),
+					base: decodeComponentMulti(encodedBase),
+					scheme: baseInfo.scheme,
+					authority: baseInfo.authority,
+					path: resolved.path,
+					query: combinedQuery
+				});
+
+				return event.respondWith(processResourceRequest(event, {
+					scheme: baseInfo.scheme,
+					authority: baseInfo.authority,
+					path: resolved.path,
+					query: combinedQuery,
+				}));
+			} catch (error) {
+				log('failed to resolve same-origin resource proxy', { encodedBase, error: `${error}` });
+				return event.respondWith(fetch(event.request));
+			}
+		} else {
+			return event.respondWith(fetch(event.request));
+		}
+	}
 	if (typeof resourceBaseAuthority === 'string' && resourceBaseAuthority.length > 0 && requestUrl.protocol === `${resourceBaseScheme}:` && requestUrl.hostname.endsWith('.' + resourceBaseAuthority)) {
 		switch (event.request.method) {
 			case 'GET':
@@ -230,10 +378,12 @@ sw.addEventListener('fetch', (event) => {
 });
 
 sw.addEventListener('install', (event) => {
+	log('install event');
 	event.waitUntil(sw.skipWaiting()); // Activate worker immediately
 });
 
 sw.addEventListener('activate', (event) => {
+	log('activate event - claiming clients');
 	event.waitUntil(sw.clients.claim()); // Become available to all pages
 });
 
@@ -398,6 +548,13 @@ async function processResourceRequest(
 		}
 
 		for (const parentClient of parentClients) {
+			log('same-origin load-resource', {
+				id: requestId,
+				scheme: requestUrlComponents.scheme,
+				authority: requestUrlComponents.authority,
+				path: requestUrlComponents.path,
+				query: requestUrlComponents.query
+			});
 			parentClient.postMessage({
 				channel: 'load-resource',
 				id: requestId,
@@ -409,6 +566,13 @@ async function processResourceRequest(
 			});
 		}
 	} else if (client.type === 'worker' || client.type === 'sharedworker') {
+		log('same-origin load-resource via message port', {
+			id: requestId,
+			scheme: requestUrlComponents.scheme,
+			authority: requestUrlComponents.authority,
+			path: requestUrlComponents.path,
+			query: requestUrlComponents.query
+		});
 		outerIframeMessagePort?.postMessage({
 			channel: 'load-resource',
 			id: requestId,

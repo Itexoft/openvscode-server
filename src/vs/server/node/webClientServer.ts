@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { createReadStream, promises } from 'fs';
+import { Buffer } from 'buffer';
 import * as http from 'http';
 import * as url from 'url';
 import * as cookie from 'cookie';
@@ -112,6 +113,8 @@ export class WebClientServer {
 
 	private readonly _webExtensionResourceUrlTemplate: URI | undefined;
 	private _webviewServiceWorkerVersionPromise: Promise<string> | undefined;
+	private _webviewServiceWorkerInfoPromise: Promise<{ version: string; sourceText: string }> | undefined;
+	private _webviewPreIndexCache: { mtimeMs: number; etag: string; content: string } | undefined;
 
 	constructor(
 		private readonly _connectionToken: ServerConnectionToken,
@@ -136,6 +139,23 @@ export class WebClientServer {
 	async handle(req: http.IncomingMessage, res: http.ServerResponse, parsedUrl: url.UrlWithParsedQuery, pathname: string): Promise<void> {
 		console.log(`[WebClientServer] handle ${req.method} ${pathname} origin=${req.headers.origin ?? ''}`);
 		try {
+			const ossMatch = /^\/oss-[0-9a-f]+(\/.*)$/.exec(pathname);
+			if (ossMatch && ossMatch[1]) {
+				const ossPath = ossMatch[1];
+				if (ossPath.startsWith(STATIC_PATH) && ossPath.charCodeAt(STATIC_PATH.length) === CharCode.Slash) {
+					return this._handleStatic(req, res, ossPath.substring(STATIC_PATH.length));
+				}
+				if (ossPath === '/') {
+					return this._handleRoot(req, res, parsedUrl);
+				}
+				if (ossPath === CALLBACK_PATH) {
+					return this._handleCallback(res);
+				}
+				if (ossPath.startsWith(WEB_EXTENSION_PATH) && ossPath.charCodeAt(WEB_EXTENSION_PATH.length) === CharCode.Slash) {
+					return this._handleWebExtensionResource(req, res, ossPath.substring(WEB_EXTENSION_PATH.length));
+				}
+			}
+
 			if (pathname.startsWith(STATIC_PATH) && pathname.charCodeAt(STATIC_PATH.length) === CharCode.Slash) {
 				return this._handleStatic(req, res, pathname.substring(STATIC_PATH.length));
 			}
@@ -167,10 +187,22 @@ export class WebClientServer {
 		const headers: Record<string, string> = Object.create(null);
 
 		// Strip the this._staticRoute from the path
-		const normalizedPathname = decodeURIComponent(resourcePath); // support paths that are uri-encoded (e.g. spaces => %20)
+		let normalizedPathname = decodeURIComponent(resourcePath).replace(/^\/+/, ''); // support paths that are uri-encoded (e.g. spaces => %20)
+
+		// Allow requests routed through /oss-<commit>/static/... to fall back to /static/...
+		if (normalizedPathname.startsWith('oss-')) {
+			const firstSlash = normalizedPathname.indexOf('/');
+			if (firstSlash !== -1) {
+				normalizedPathname = normalizedPathname.slice(firstSlash + 1);
+				if (normalizedPathname.startsWith('static/')) {
+					normalizedPathname = normalizedPathname.slice('static/'.length);
+				}
+			}
+		}
 
 		const filePath = join(APP_ROOT, normalizedPathname); // join also normalizes the path
-		if (!isEqualOrParent(filePath, APP_ROOT, !isLinux)) {
+		const normalizedFilePath = normalize(filePath);
+		if (!isEqualOrParent(normalizedFilePath, APP_ROOT, !isLinux)) {
 			return serveError(req, res, 400, `Bad request.`);
 		}
 
@@ -202,7 +234,119 @@ export class WebClientServer {
 			return void res.end();
 		}
 
-		return serveFile(filePath, this._environmentService.isBuilt ? CacheControl.NO_EXPIRY : CacheControl.ETAG, this._logService, req, res, headers);
+		if (normalizedPathname === 'out/vs/workbench/contrib/webview/browser/pre/index.html') {
+			return this._serveWebviewPreIndex(normalizedFilePath, this._environmentService.isBuilt ? CacheControl.NO_EXPIRY : CacheControl.ETAG, req, res, headers);
+		}
+
+		return serveFile(normalizedFilePath, this._environmentService.isBuilt ? CacheControl.NO_EXPIRY : CacheControl.ETAG, this._logService, req, res, headers);
+	}
+
+	private async _serveWebviewPreIndex(filePath: string, cacheControl: CacheControl, req: http.IncomingMessage, res: http.ServerResponse, headers: Record<string, string>): Promise<void> {
+		let stat;
+		try {
+			stat = await promises.stat(filePath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+				return serveError(req, res, 404, 'Not found.');
+			}
+			this._logService.error(`[WebClientServer] Failed to stat webview index: ${error instanceof Error ? error.message : String(error)}`);
+			return serveError(req, res, 500, 'Internal Server Error.');
+		}
+
+		const entry = await this._getWebviewPreIndexContent(filePath, stat.mtimeMs);
+		const ifNoneMatchHeader = req.headers['if-none-match'];
+		const ifNoneMatch = Array.isArray(ifNoneMatchHeader) ? ifNoneMatchHeader[0] : ifNoneMatchHeader;
+		if (typeof ifNoneMatch === 'string' && ifNoneMatch === entry.etag) {
+			res.writeHead(304);
+			return void res.end();
+		}
+
+		if (cacheControl === CacheControl.NO_EXPIRY) {
+			headers['Cache-Control'] = 'public, max-age=31536000';
+		} else if (cacheControl === CacheControl.NO_CACHING) {
+			headers['Cache-Control'] = 'no-store';
+		}
+
+		headers['Content-Type'] = 'text/html';
+		headers['Etag'] = entry.etag;
+
+		res.writeHead(200, headers);
+		if (req.method === 'HEAD') {
+			return void res.end();
+		}
+
+		return void res.end(entry.content);
+	}
+
+	private async _getWebviewPreIndexContent(filePath: string, mtimeMs: number): Promise<{ content: string; etag: string; mtimeMs: number }> {
+		const cached = this._webviewPreIndexCache;
+		if (cached && cached.mtimeMs === mtimeMs) {
+			return cached;
+		}
+
+		let raw: string;
+		try {
+			raw = (await promises.readFile(filePath)).toString();
+		} catch (error) {
+			this._logService.error(`[WebClientServer] Failed to read webview index: ${error instanceof Error ? error.message : String(error)}`);
+			throw error;
+		}
+
+		let serviceWorkerInfo: { version: string; sourceText: string } | undefined;
+		try {
+			serviceWorkerInfo = await this._getWebviewServiceWorkerInfo();
+		} catch (error) {
+			this._logService.error(`[WebClientServer] Failed to load webview service worker source: ${error instanceof Error ? error.message : String(error)}`);
+		}
+
+		const rewritten = this._rewriteWebviewPreIndexCsp(raw, serviceWorkerInfo);
+		const etag = `W/"${crypto.createHash('sha256').update(rewritten).digest('hex')}"`;
+
+		const entry = { content: rewritten, etag, mtimeMs };
+		this._webviewPreIndexCache = entry;
+		return entry;
+	}
+
+	private _rewriteWebviewPreIndexCsp(html: string, info?: { version: string; sourceText: string }): string {
+		const metaRegex = /(<meta\s+http-equiv="Content-Security-Policy"\s+content=")([^"]*)("[^>]*>)/i;
+		const match = metaRegex.exec(html);
+		if (!match) {
+			return html;
+		}
+
+		const originalCsp = match[2];
+		const directives = originalCsp.split(';').map(d => d.trim()).filter(d => d.length > 0);
+		const scriptIndex = directives.findIndex(d => d.startsWith('script-src'));
+		if (scriptIndex === -1) {
+			return html;
+		}
+
+		const scriptDirective = directives[scriptIndex];
+		const tokens = scriptDirective.split(/\s+/);
+		const directiveName = tokens.shift();
+		if (!directiveName) {
+			return html;
+		}
+
+		const preserved = tokens.filter(token => !/^'sha256-[^']*'$/.test(token));
+		if (!preserved.includes("'self'")) {
+			preserved.unshift("'self'");
+		}
+		if (!preserved.includes("'unsafe-inline'")) {
+			preserved.push("'unsafe-inline'");
+		}
+		const deduped = Array.from(new Set(preserved));
+
+		directives[scriptIndex] = [directiveName, ...deduped].join(' ');
+		const trailingSemicolon = /\s*;\s*$/.test(originalCsp) ? ';' : '';
+		const updatedCsp = `${directives.join('; ')}${trailingSemicolon}`;
+
+		let rewritten = html.replace(metaRegex, `$1${updatedCsp}$3`);
+		const sourceReplacement = info?.sourceText ? JSON.stringify(Buffer.from(info.sourceText, 'utf-8').toString('base64')) : 'null';
+		const versionReplacement = info?.version ? JSON.stringify(info.version) : 'undefined';
+		rewritten = rewritten.replace('/*__SERVICE_WORKER_SOURCE__*/ null', sourceReplacement);
+		rewritten = rewritten.replace('/*__SERVICE_WORKER_VERSION__*/ undefined', versionReplacement);
+		return rewritten;
 	}
 
 	private _getResourceURLTemplateAuthority(uri: URI): string | undefined {
@@ -292,6 +436,71 @@ export class WebClientServer {
 			return trimmed || undefined;
 		};
 
+		const splitAuthority = (authority: string): { host: string; port: string | undefined } => {
+			if (authority.startsWith('[')) {
+				const closing = authority.indexOf(']');
+				if (closing !== -1) {
+					const host = authority.slice(0, closing + 1);
+					const rest = authority.slice(closing + 1);
+					if (rest.startsWith(':')) {
+						return { host, port: rest.slice(1) };
+					}
+					return { host, port: undefined };
+				}
+			}
+
+			const lastColon = authority.lastIndexOf(':');
+			if (lastColon > -1 && authority.indexOf(':') === lastColon) {
+				return {
+					host: authority.slice(0, lastColon),
+					port: authority.slice(lastColon + 1),
+				};
+			}
+
+			return { host: authority, port: undefined };
+		};
+
+		const parseForwardedHeader = (raw: string | undefined) => {
+			if (!raw) {
+				return {};
+			}
+			const [firstEntry] = raw.split(',');
+			if (!firstEntry) {
+				return {};
+			}
+
+			const result: { proto?: string; host?: string; port?: string } = {};
+			for (const segment of firstEntry.split(';')) {
+				const [rawKey, rawValue] = segment.split('=');
+				if (!rawKey || !rawValue) {
+					continue;
+				}
+				const key = rawKey.trim().toLowerCase();
+				let value = rawValue.trim();
+				if (value.startsWith('"') && value.endsWith('"')) {
+					value = value.slice(1, -1);
+				}
+				if (!value) {
+					continue;
+				}
+				if (key === 'proto') {
+					result.proto = value.toLowerCase();
+				} else if (key === 'host') {
+					result.host = value;
+				} else if (key === 'port') {
+					result.port = value;
+				}
+			}
+			return result;
+		};
+
+		const forwardedFromForwardedHeader = parseForwardedHeader(getFirstHeader('forwarded'));
+		const forwardedProtoHeader = forwardedFromForwardedHeader.proto ?? getFirstHeader('x-forwarded-proto');
+		const forwardedHostHeaderRaw = forwardedFromForwardedHeader.host ?? getFirstHeader('x-forwarded-host');
+		const forwardedHostParts = forwardedHostHeaderRaw ? splitAuthority(forwardedHostHeaderRaw) : undefined;
+		const forwardedHost = forwardedHostParts?.host?.trim();
+		const forwardedPortHeader = forwardedFromForwardedHeader.port ?? getFirstHeader('x-forwarded-port') ?? forwardedHostParts?.port;
+
 		const normalizeAuthority = (authority: string | undefined) => {
 			if (!authority) {
 				return undefined;
@@ -323,9 +532,20 @@ export class WebClientServer {
 		};
 
 		const getProtocol = () => {
-			const forwardedProto = getFirstHeader('x-forwarded-proto');
-			if (forwardedProto) {
-				return forwardedProto.split(',')[0]?.trim().toLowerCase() === 'https' ? 'https' : 'http';
+			const forwardedProto = forwardedProtoHeader?.split(',')[0]?.trim().toLowerCase();
+			if (forwardedProto === 'https') {
+				return 'https';
+			}
+			if (forwardedProto === 'http') {
+				return 'http';
+			}
+
+			const forwardedPort = forwardedPortHeader?.split(',')[0]?.trim();
+			if (forwardedPort === '443') {
+				return 'https';
+			}
+			if (forwardedPort === '80') {
+				return 'http';
 			}
 
 			// Node's IncomingMessage doesn't guarantee socket to be TLSSocket, so we use type assertion.
@@ -363,13 +583,51 @@ export class WebClientServer {
 			return void res.end();
 		}
 
-		const replacePort = (host: string, port: string) => {
-			const index = host?.indexOf(':');
-			if (index !== -1) {
-				host = host?.substring(0, index);
+		const protocol = getProtocol();
+		const formatAuthority = (host: string, port: string | undefined) => {
+			if (!port || !port.trim()) {
+				return host;
 			}
-			host += `:${port}`;
-			return host;
+			return `${host}:${port.trim()}`;
+		};
+
+		const shouldOmitPortForProtocol = (port: string | undefined, scheme: string) => {
+			if (!port) {
+				return true;
+			}
+
+			const trimmed = port.trim();
+			if (!trimmed) {
+				return true;
+			}
+
+			if (scheme === 'https' && trimmed === '443') {
+				return true;
+			}
+			if (scheme === 'http' && trimmed === '80') {
+				return true;
+			}
+
+			return false;
+		};
+
+		const replacePort = (authority: string, port: string | undefined, scheme: string) => {
+			const { host } = splitAuthority(authority);
+			if (shouldOmitPortForProtocol(port, scheme)) {
+				return host;
+			}
+			return formatAuthority(host, port);
+		};
+
+		const normalizeDefaultPort = (authority: string | undefined, scheme: string) => {
+			if (!authority) {
+				return authority;
+			}
+			const { host, port } = splitAuthority(authority);
+			if (shouldOmitPortForProtocol(port, scheme)) {
+				return host;
+			}
+			return formatAuthority(host, port);
 		};
 
 		const useTestResolver = (!this._environmentService.isBuilt && this._environmentService.args['use-test-resolver']);
@@ -382,6 +640,7 @@ export class WebClientServer {
 				remoteAuthority = proxyPortOverride ? `${proxyHostOverride}:${proxyPortOverride}` : proxyHostOverride;
 			} else {
 				const candidates: (string | undefined)[] = [
+					forwardedHost,
 					getFirstHeader('x-original-host'),
 					getFirstHeader('x-forwarded-host'),
 					normalizeAuthority(req.headers.host)
@@ -391,18 +650,18 @@ export class WebClientServer {
 		if (!remoteAuthority) {
 				return serveError(req, res, 400, `Bad request.`);
 			}
-		if (!proxyHostOverride) {
-				const forwardedPort = getFirstHeader('x-forwarded-port');
+		if (!proxyHostOverride && remoteAuthority) {
+				const forwardedPort = forwardedPortHeader?.split(',')[0]?.trim();
 				if (forwardedPort) {
-					remoteAuthority = replacePort(remoteAuthority, forwardedPort);
+					remoteAuthority = replacePort(remoteAuthority, forwardedPort, protocol);
 				}
 			}
+
+		remoteAuthority = normalizeDefaultPort(remoteAuthority, protocol);
 
 		function asJSON(value: unknown): string {
 				return JSON.stringify(value).replace(/"/g, '&quot;');
 			}
-
-		const protocol = getProtocol();
 
 		let _wrapWebWorkerExtHostInIframe: undefined | false = undefined;
 		if (this._environmentService.args['enable-smoke-test-driver']) {
@@ -533,8 +792,8 @@ export class WebClientServer {
 			`frame-src 'self' ${protocol}://${remoteAuthority} https://*.vscode-cdn.net data:;`,
 			'worker-src \'self\' data: blob:;',
 			'style-src \'self\' \'unsafe-inline\';',
-			'connect-src \'self\' ws: wss: https:;',
-			'font-src \'self\' blob:;',
+			'connect-src \'self\' ws: wss: https: http:;',
+			'font-src \'self\' https: http: data: blob:;',
 			'manifest-src \'self\';'
 		].join(' ');
 
@@ -564,9 +823,8 @@ export class WebClientServer {
 		if (!this._webviewServiceWorkerVersionPromise) {
 			this._webviewServiceWorkerVersionPromise = (async () => {
 				try {
-					const serviceWorkerPath = join(APP_ROOT, 'static', 'out', 'vs', 'workbench', 'contrib', 'webview', 'browser', 'pre', 'service-worker.js');
-					const content = await promises.readFile(serviceWorkerPath);
-					return crypto.createHash('sha256').update(content).digest('hex');
+					const info = await this._getWebviewServiceWorkerInfo();
+					return info.version;
 				} catch (error) {
 					this._logService.error(`[WebClientServer] Failed to compute webview service worker version: ${error instanceof Error ? error.message : String(error)}`);
 					return this._productService.commit ?? Date.now().toString();
@@ -577,16 +835,38 @@ export class WebClientServer {
 		return this._webviewServiceWorkerVersionPromise;
 	}
 
+	private async _getWebviewServiceWorkerInfo(): Promise<{ version: string; sourceText: string }> {
+		if (!this._webviewServiceWorkerInfoPromise) {
+			this._webviewServiceWorkerInfoPromise = (async () => {
+				const serviceWorkerPath = join(APP_ROOT, 'static', 'out', 'vs', 'workbench', 'contrib', 'webview', 'browser', 'pre', 'service-worker.js');
+				const contentBuffer = await promises.readFile(serviceWorkerPath);
+				return {
+					version: crypto.createHash('sha256').update(contentBuffer).digest('hex'),
+					sourceText: contentBuffer.toString('utf-8')
+				};
+			})();
+		}
+
+		return this._webviewServiceWorkerInfoPromise;
+	}
+
 	private _getScriptCspHashes(content: string): string[] {
 		// Compute the CSP hashes for line scripts. Uses regex
 		// which means it isn't 100% good.
-		const regex = /<script>([\s\S]+?)<\/script>/img;
+		const regex = /<script\b([^>]*)>([\s\S]*?)<\/script>/img;
 		const result: string[] = [];
 		let match: RegExpExecArray | null;
 		while (match = regex.exec(content)) {
+			const attributes = match[1];
+			if (/\ssrc\s*=/.test(attributes ?? '')) {
+				continue;
+			}
 			const hasher = crypto.createHash('sha256');
 			// This only works on Windows if we strip `\r` from `\r\n`.
-			const script = match[1].replace(/\r\n/g, '\n');
+			const script = match[2].replace(/\r\n/g, '\n');
+			if (!script.trim()) {
+				continue;
+			}
 			const hash = hasher
 				.update(Buffer.from(script))
 				.digest().toString('base64');
