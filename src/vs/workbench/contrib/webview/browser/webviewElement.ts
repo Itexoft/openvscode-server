@@ -414,11 +414,11 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 		element.name = this.id;
 		element.className = `webview ${options.customClasses || ''}`;
 		element.sandbox.add('allow-scripts', 'allow-same-origin', 'allow-forms', 'allow-pointer-lock', 'allow-downloads');
-
 		const allowRules = ['cross-origin-isolated', 'autoplay'];
 		if (!isFirefox) {
 			allowRules.push('clipboard-read', 'clipboard-write');
 		}
+		allowRules.push('storage-access-by-user-activation');
 		element.setAttribute('allow', allowRules.join('; '));
 
 		element.style.border = 'none';
@@ -504,7 +504,7 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 	}
 
 	private _registerMessageHandler(targetWindow: CodeWindow) {
-		const subscription = this._register(addDisposableListener(targetWindow, 'message', (e: MessageEvent) => {
+		this._register(addDisposableListener(targetWindow, 'message', (e: MessageEvent) => {
 			if (!this._encodedWebviewOrigin || e?.data?.target !== this.id) {
 				return;
 			}
@@ -515,12 +515,18 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 			}
 
 			if (e.data.channel === 'webview-ready') {
-				if (this._messagePort) {
-					return;
-				}
-
+				const isReload = !!this._messagePort;
 				this.perfMark('webview-ready');
-				this._logService.trace(`Webview(${this.id}): webview ready`);
+				this._logService.trace(`Webview(${this.id}): webview ready${isReload ? ' (reconnected)' : ''}`);
+
+				if (this._messagePort) {
+					try {
+						this._messagePort.onmessage = null;
+						this._messagePort.close();
+					} catch (error) {
+						this._logService.debug(`Webview(${this.id}): failed to close previous message port`, error);
+					}
+				}
 
 				this._messagePort = e.ports[0];
 				this._messagePort.onmessage = (e) => {
@@ -536,10 +542,17 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 
 				if (this._state.type === WebviewState.Type.Initializing) {
 					this._state.pendingMessages.forEach(({ channel, data, resolve }) => resolve(this.doPostMessage(channel, data)));
+				} else {
+					this.reload();
+					this.style();
+					if (typeof this._confirmBeforeClose !== 'undefined') {
+						this._send('set-confirm-before-close', this._confirmBeforeClose);
+					}
+					if (this._focused) {
+						this._send('focus', undefined);
+					}
 				}
 				this._state = WebviewState.Ready;
-
-				subscription.dispose();
 			}
 		}));
 	}
@@ -773,11 +786,15 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 
 	private async loadResource(id: number, uri: URI, ifNoneMatch: string | undefined) {
 		try {
-			console.log('[WebviewHost] localResourceRoots', this._content.options.localResourceRoots?.map(root => root.toString(true)));
+			const roots = this._content.options.localResourceRoots?.map(root => root.toString(true)) ?? [];
+			console.log('[WebviewHost] localResourceRoots', roots);
+			this._logService.warn(`WebviewHost(${this.id}) load-resource`, { roots, uri: uri.toString(true) });
+			(globalThis as any).__lastLocalResourceRoots = roots;
 			const result = await loadLocalResource(uri, {
 				ifNoneMatch,
 				roots: this._content.options.localResourceRoots || [],
 			}, this._fileService, this._logService, this._resourceLoadingCts.token);
+			(globalThis as any).__lastRequestedResource = uri.toString(true);
 
 			switch (result.type) {
 				case WebviewResourceResponse.Type.Success: {

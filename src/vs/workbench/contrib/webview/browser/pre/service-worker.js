@@ -22,6 +22,31 @@ const remoteAuthority = searchParams.get('remoteAuthority');
 /** @type {MessagePort|undefined} */
 let outerIframeMessagePort;
 
+/** @type {{ request: string, target: ResourceRequestUrlComponents } | undefined} */
+let lastResourceDebug;
+
+const DEBUG_LAST_RESOURCE_SEGMENT = '__debug__/last-resource';
+
+const createLastResourceResponse = () => new Response(JSON.stringify(lastResourceDebug ?? null), {
+	status: 200,
+	headers: { 'Content-Type': 'application/json' }
+});
+
+/**
+ * @param {FetchEvent} event
+ */
+const respondWithLastResource = (event) => event.respondWith(createLastResourceResponse());
+
+/**
+ * @param {string} segment
+ */
+const isDebugResourceSegment = (segment) => {
+	const queryIndex = segment.indexOf('?');
+	const withoutQuery = queryIndex === -1 ? segment : segment.slice(0, queryIndex);
+	const trimmed = withoutQuery.replace(/^(\.\/)+/, '');
+	return trimmed === DEBUG_LAST_RESOURCE_SEGMENT;
+};
+
 /**
  * Origin used for resources
  */
@@ -138,6 +163,71 @@ const resolveResourceSegment = (basePath, resourceSegment) => {
 			query: '',
 		};
 	}
+};
+
+const resolveNestedResource = (baseInfo, resourceSegmentRaw, requestUrlSearch) => {
+	let currentBase = baseInfo;
+	let remaining = resourceSegmentRaw;
+
+	while (remaining.startsWith('resource/')) {
+		remaining = remaining.slice('resource/'.length);
+		const slashIndex = remaining.indexOf('/');
+		if (slashIndex === -1) {
+			return undefined;
+		}
+
+		const nestedEncodedBase = remaining.slice(0, slashIndex);
+		const nestedBaseInfo = parseEncodedBaseHref(nestedEncodedBase);
+		if (!nestedBaseInfo) {
+			return undefined;
+		}
+
+		currentBase = nestedBaseInfo;
+		remaining = remaining.slice(slashIndex + 1);
+	}
+
+	if (!remaining.length) {
+		return {
+			scheme: currentBase.scheme,
+			authority: currentBase.authority,
+			path: currentBase.path,
+			query: currentBase.query || requestUrlSearch,
+		};
+	}
+
+	let segmentPathRaw = remaining;
+	let segmentQueryRaw = '';
+	const questionIndex = remaining.indexOf('?');
+	if (questionIndex !== -1) {
+		segmentPathRaw = remaining.slice(0, questionIndex);
+		segmentQueryRaw = remaining.slice(questionIndex + 1);
+	}
+
+	const decodedSegment = decodeComponentMulti(segmentPathRaw);
+	const resolved = resolveResourceSegment(currentBase.path, decodedSegment);
+
+	const decodedSegmentQuery = segmentQueryRaw ? decodeComponentMulti(segmentQueryRaw) : '';
+	const combinedQuery = resolved.query
+		|| decodedSegmentQuery
+		|| currentBase.query
+		|| requestUrlSearch;
+
+	const target = {
+		scheme: currentBase.scheme,
+		authority: currentBase.authority,
+		path: resolved.path,
+		query: combinedQuery,
+	};
+
+	log('resolve nested resource', {
+		base: currentBase,
+		raw: resourceSegmentRaw,
+		remaining,
+		decodedSegment,
+		target
+	});
+
+	return target;
 };
 
 
@@ -271,6 +361,21 @@ sw.addEventListener('message', async (event) => {
 			log('message:did-load-localhost', { id: data.id, origin: data.origin, location: data.location });
 			return;
 		}
+		case 'debug-get-last-resource': {
+			const respond = (client) => {
+				if (client && lastResourceDebug) {
+					client.postMessage({ channel: 'debug-last-resource', data: lastResourceDebug });
+					return true;
+				}
+				return false;
+			};
+			sw.clients.get(source.id).then(client => {
+				if (!respond(client) && outerIframeMessagePort && lastResourceDebug) {
+					outerIframeMessagePort.postMessage({ channel: 'debug-last-resource', data: lastResourceDebug });
+				}
+			});
+			return;
+		}
 		default: {
 			log('message:unknown-channel', event.data);
 			console.log('Unknown message');
@@ -283,14 +388,42 @@ sw.addEventListener('fetch', (event) => {
 	const requestUrl = new URL(event.request.url);
 	log('fetch event', { url: requestUrl.toString() });
 
+	if (requestUrl.origin === sw.origin && requestUrl.pathname === `${rootPath}/__debug__/last-resource`) {
+		return respondWithLastResource(event);
+	}
+
 	const sameOriginResourcePrefix = `${rootPath}/resource/`;
 	if (requestUrl.origin === sw.origin && requestUrl.pathname.startsWith(sameOriginResourcePrefix)) {
 		log('resource fetch candidate', { pathname: requestUrl.pathname });
 		const remainder = requestUrl.pathname.slice(sameOriginResourcePrefix.length);
 		const firstSlash = remainder.indexOf('/');
 		if (firstSlash > 0) {
-			const encodedBase = remainder.slice(0, firstSlash);
-			const resourceSegmentRaw = remainder.slice(firstSlash + 1);
+			let encodedBase = remainder.slice(0, firstSlash);
+			const normalizeEncodedBase = (value) => {
+				const decoded = decodeComponentMulti(value);
+				if (/^https?:\/\/vscode-remote\+/i.test(decoded)) {
+					return encodeURIComponent(decoded);
+				}
+				return value;
+			};
+			encodedBase = normalizeEncodedBase(encodedBase);
+			let resourceSegmentRaw = remainder.slice(firstSlash + 1);
+			const sanitizeSegment = (segment) => {
+				const slashIndex = segment.indexOf('/');
+				const head = slashIndex === -1 ? segment : segment.slice(0, slashIndex);
+				const tail = slashIndex === -1 ? '' : segment.slice(slashIndex);
+				const decodedHead = decodeComponentMulti(head);
+				if (/^https?:\/\/vscode-remote\+/i.test(decodedHead)) {
+					const sanitizedHead = encodeURIComponent(decodedHead);
+					return `${sanitizedHead}${tail}`;
+				}
+				return segment;
+			};
+			resourceSegmentRaw = sanitizeSegment(resourceSegmentRaw);
+
+			if (isDebugResourceSegment(resourceSegmentRaw)) {
+				return respondWithLastResource(event);
+			}
 
 			try {
 				const baseInfo = parseEncodedBaseHref(encodedBase);
@@ -300,28 +433,32 @@ sw.addEventListener('fetch', (event) => {
 				}
 				log('parsed base href', { base: baseInfo, resourceSegmentRaw });
 
-				const resourceSegment = decodeComponentMulti(resourceSegmentRaw);
-				const resolved = resolveResourceSegment(baseInfo.path, resourceSegment);
-
-				const combinedQuery = resolved.query
-					|| baseInfo.query
-					|| requestUrl.search.replace(/^\?/, '');
+				const target = resolveNestedResource(baseInfo, resourceSegmentRaw, requestUrl.search.replace(/^\?/, ''));
+				if (!target) {
+					log('failed to resolve nested resource proxy', { encodedBase, resourceSegmentRaw });
+					return event.respondWith(fetch(event.request));
+				}
 
 				log('same-origin resource proxy', {
 					request: requestUrl.toString(),
 					base: decodeComponentMulti(encodedBase),
-					scheme: baseInfo.scheme,
-					authority: baseInfo.authority,
-					path: resolved.path,
-					query: combinedQuery
+					resourceSegmentRaw,
+					target
 				});
+				lastResourceDebug = { request: requestUrl.toString(), target };
+				try {
+					const debugResponse = new Response(JSON.stringify(lastResourceDebug), {
+						status: 200,
+						headers: { 'Content-Type': 'application/json' }
+					});
+					caches.open(resourceCacheName).then(cache => {
+						cache.put(`${sw.origin}${rootPath}/__debug__/last-resource`, debugResponse);
+					});
+				} catch (error) {
+					log('failed to cache last resource debug', `${error}`);
+				}
 
-				return event.respondWith(processResourceRequest(event, {
-					scheme: baseInfo.scheme,
-					authority: baseInfo.authority,
-					path: resolved.path,
-					query: combinedQuery,
-				}));
+				return event.respondWith(processResourceRequest(event, target));
 			} catch (error) {
 				log('failed to resolve same-origin resource proxy', { encodedBase, error: `${error}` });
 				return event.respondWith(fetch(event.request));
@@ -408,13 +545,9 @@ async function processResourceRequest(
 	let client = await sw.clients.get(event.clientId);
 	if (!client) {
 		client = await getWorkerClientForId(event.clientId);
-		if (!client) {
-			console.error('Could not find inner client for request');
-			return notFound();
-		}
 	}
 
-	const webviewId = getWebviewIdForClient(client);
+	const webviewId = client ? getWebviewIdForClient(client) : null;
 
 	// Refs https://github.com/microsoft/vscode/issues/244143
 	// With PlzDedicatedWorker, worker subresources and blob wokers
@@ -540,40 +673,19 @@ async function processResourceRequest(
 
 	const { requestId, promise } = resourceRequestStore.create();
 
-	if (webviewId) {
-		const parentClients = await getOuterIframeClient(webviewId);
-		if (!parentClients.length) {
-			console.log('Could not find parent client for request');
-			return notFound();
+	const dispatchToOuterIframe = () => {
+		if (!outerIframeMessagePort) {
+			return false;
 		}
-
-		for (const parentClient of parentClients) {
-			log('same-origin load-resource', {
-				id: requestId,
-				scheme: requestUrlComponents.scheme,
-				authority: requestUrlComponents.authority,
-				path: requestUrlComponents.path,
-				query: requestUrlComponents.query
-			});
-			parentClient.postMessage({
-				channel: 'load-resource',
-				id: requestId,
-				scheme: requestUrlComponents.scheme,
-				authority: requestUrlComponents.authority,
-				path: requestUrlComponents.path,
-				query: requestUrlComponents.query,
-				ifNoneMatch: cached?.headers.get('ETag'),
-			});
-		}
-	} else if (client.type === 'worker' || client.type === 'sharedworker') {
-		log('same-origin load-resource via message port', {
+		log('same-origin load-resource via message port (fallback)', {
 			id: requestId,
+			clientFound: !!client,
 			scheme: requestUrlComponents.scheme,
 			authority: requestUrlComponents.authority,
 			path: requestUrlComponents.path,
 			query: requestUrlComponents.query
 		});
-		outerIframeMessagePort?.postMessage({
+		outerIframeMessagePort.postMessage({
 			channel: 'load-resource',
 			id: requestId,
 			scheme: requestUrlComponents.scheme,
@@ -582,6 +694,57 @@ async function processResourceRequest(
 			query: requestUrlComponents.query,
 			ifNoneMatch: cached?.headers.get('ETag'),
 		});
+		return true;
+	};
+
+	if (webviewId && client) {
+		const parentClients = await getOuterIframeClient(webviewId);
+		if (!parentClients.length) {
+			console.log('Could not find parent client for request');
+			if (!dispatchToOuterIframe()) {
+				return notFound();
+			}
+		} else {
+			for (const parentClient of parentClients) {
+				log('same-origin load-resource', {
+					id: requestId,
+					scheme: requestUrlComponents.scheme,
+					authority: requestUrlComponents.authority,
+					path: requestUrlComponents.path,
+					query: requestUrlComponents.query
+				});
+				parentClient.postMessage({
+					channel: 'load-resource',
+					id: requestId,
+					scheme: requestUrlComponents.scheme,
+					authority: requestUrlComponents.authority,
+					path: requestUrlComponents.path,
+					query: requestUrlComponents.query,
+					ifNoneMatch: cached?.headers.get('ETag'),
+				});
+			}
+		}
+	} else if (client && (client.type === 'worker' || client.type === 'sharedworker')) {
+		log('same-origin load-resource via message port', {
+			id: requestId,
+			scheme: requestUrlComponents.scheme,
+			authority: requestUrlComponents.authority,
+			path: requestUrlComponents.path,
+			query: requestUrlComponents.query
+		});
+		if (!dispatchToOuterIframe()) {
+			return notFound();
+		}
+	} else {
+		log('missing client for resource request; attempting message-port fallback', {
+			clientId: event.clientId,
+			requestId,
+			target: requestUrlComponents
+		});
+		if (!dispatchToOuterIframe()) {
+			console.error('Could not find inner client for request');
+			return notFound();
+		}
 	}
 
 	return promise.then(entry => resolveResourceEntry(entry, cached));

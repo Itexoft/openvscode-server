@@ -159,13 +159,30 @@ export function asWebviewUri(resource: URI, remoteInfo?: WebviewRemoteInfo): URI
 		? `${resourceHost}:${webviewResourceConfiguration.resourceAuthorityPort}`
 		: resourceHost;
 
-	return URI.from({
+	const result = URI.from({
 		scheme: webviewResourceConfiguration.resourceScheme,
 		authority,
 		path: resource.path,
 		fragment: resource.fragment,
 		query: resource.query,
 	});
+
+	try {
+		const store = (globalThis as any).__lastAsWebviewUri as Array<{ input: string; output: string }> | undefined;
+		const entry = { input: resource.toString(true), output: result.toString(true) };
+		if (Array.isArray(store)) {
+			store.push(entry);
+			if (store.length > 10) {
+				store.shift();
+			}
+		} else {
+			(globalThis as any).__lastAsWebviewUri = [entry];
+		}
+	} catch {
+		// ignore diagnostics
+	}
+
+	return result;
 }
 
 function encodeAuthority(authority: string): string {

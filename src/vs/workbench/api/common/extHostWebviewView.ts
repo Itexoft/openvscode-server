@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { CancellationToken } from '../../../base/common/cancellation.js';
+import { URI } from '../../../base/common/uri.js';
 import { Emitter } from '../../../base/common/event.js';
 import { Disposable } from '../../../base/common/lifecycle.js';
 import { IExtensionDescription } from '../../../platform/extensions/common/extensions.js';
@@ -190,9 +191,16 @@ export class ExtHostWebviewViews implements extHostProtocol.ExtHostWebviewViewsS
 			throw new Error(`No view provider found for '${viewType}'`);
 		}
 
-		const { provider, extension } = entry;
+	const { provider, extension } = entry;
 
-		const webview = this._extHostWebview.createNewWebview(webviewHandle, { /* todo */ }, extension);
+		const webview = this._extHostWebview.createNewWebview(webviewHandle, {}, extension);
+		const defaultResourceRoots = [extension.extensionLocation].filter(Boolean).map(root => URI.from(root));
+		if (defaultResourceRoots.length) {
+			webview.options = {
+				...webview.options,
+				localResourceRoots: defaultResourceRoots
+			};
+		}
 		const revivedView = new ExtHostWebviewView(webviewHandle, this._proxy, viewType, title, webview, true);
 
 		this._webviewViews.set(webviewHandle, revivedView);
