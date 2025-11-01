@@ -87,6 +87,8 @@ export const serverOptions: OptionDescriptions<Required<ServerParsedArgs>> = {
 	'proxy-host': { type: 'string' },
 	'proxy-port': { type: 'string' },
 	'without-browser-env-var': { type: 'boolean' },
+	'openvscode-verbose-console': { type: 'boolean' },
+	'openvscode-webview-debug': { type: 'boolean' },
 
 	/* ----- server cli ----- */
 
@@ -217,6 +219,8 @@ export interface ServerParsedArgs {
 	'proxy-host'?: string;
 	'proxy-port'?: string;
 	'without-browser-env-var'?: boolean;
+	'openvscode-verbose-console'?: boolean;
+	'openvscode-webview-debug'?: boolean;
 
 	/* ----- server cli ----- */
 	help: boolean;

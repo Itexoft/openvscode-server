@@ -94,7 +94,7 @@ const vscodeResourceIncludes = [
 	'out-build/vs/workbench/contrib/webview/browser/pre/*.{js,html}',
 
 	// Extension Host Worker
-	'out-build/vs/workbench/services/extensions/worker/webWorkerExtensionHostIframe.html',
+	'out-build/vs/workbench/services/extensions/worker/webWorkerExtensionHostIframe.{html,js}',
 
 	// Tree Sitter highlights
 	'out-build/vs/editor/common/languages/highlights/*.scm',

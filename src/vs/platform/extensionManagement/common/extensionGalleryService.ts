@@ -632,10 +632,19 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 		}
 
 		const result: IGalleryExtension[] = [];
-		for (const extension of resolvedByIndex) {
+		const unresolvedIds: string[] = [];
+		for (let i = 0; i < resolvedByIndex.length; i++) {
+			const extension = resolvedByIndex[i];
 			if (extension) {
 				result.push(extension);
+			} else {
+				unresolvedIds.push(extensionInfos[i].id);
 			}
+		}
+
+		if (unresolvedIds.length) {
+			const marketplaceNames = marketplaces.map(m => m.displayName ?? m.marketplaceId ?? m.serviceUrl);
+			this.logService.warn(`[Marketplace] Extensions not found in configured marketplaces (${marketplaceNames.join(', ')}): ${unresolvedIds.join(', ')}`);
 		}
 
 		return result;
@@ -643,29 +652,19 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 
 	private async resolveExtensionsAcrossMarketplaces(extensionInfos: ReadonlyArray<IExtensionInfo>, options: IExtensionQueryOptions, marketplaces: readonly IExtensionGalleryMarketplace[], token: CancellationToken): Promise<(IGalleryExtension | undefined)[]> {
 		const resolvedByIndex: (IGalleryExtension | undefined)[] = new Array(extensionInfos.length);
-		const unresolvedIndices = new Set<number>();
-		for (let index = 0; index < extensionInfos.length; index++) {
-			unresolvedIndices.add(index);
-		}
 
 		for (const marketplace of marketplaces) {
-			if (!unresolvedIndices.size) {
-				break;
-			}
-
-			const subsetInfos = Array.from(unresolvedIndices).map(index => extensionInfos[index]);
-			if (!subsetInfos.length) {
-				continue;
-			}
-
-			const marketplaceResults = await this.resolveExtensionsForMarketplace(subsetInfos, options, marketplace, token);
+			const marketplaceResults = await this.resolveExtensionsForMarketplace(extensionInfos, options, marketplace, token);
 			for (const extension of marketplaceResults) {
-				const matchedIndex = this.findMatchingExtensionIndex(extension, unresolvedIndices, extensionInfos);
+				const matchedIndex = this.findMatchingExtensionIndex(extension, extensionInfos);
 				if (matchedIndex === undefined) {
 					continue;
 				}
-				resolvedByIndex[matchedIndex] = extension;
-				unresolvedIndices.delete(matchedIndex);
+
+				const existing = resolvedByIndex[matchedIndex];
+				if (!existing || this.shouldPreferMarketplaceExtension(existing, extension)) {
+					resolvedByIndex[matchedIndex] = extension;
+				}
 			}
 		}
 
@@ -680,19 +679,15 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 		return this.getExtensionsUsingQueryApi(extensionInfos, options, marketplace, token);
 	}
 
-	private findMatchingExtensionIndex(extension: IGalleryExtension, unresolved: Set<number>, extensionInfos: ReadonlyArray<IExtensionInfo>): number | undefined {
-		if (!unresolved.size) {
-			return undefined;
-		}
-
-		for (const index of unresolved) {
+	private findMatchingExtensionIndex(extension: IGalleryExtension, extensionInfos: ReadonlyArray<IExtensionInfo>): number | undefined {
+		for (let index = 0; index < extensionInfos.length; index++) {
 			const info = extensionInfos[index];
 			if (info.uuid && extension.identifier.uuid && info.uuid === extension.identifier.uuid) {
 				return index;
 			}
 		}
 
-		for (const index of unresolved) {
+		for (let index = 0; index < extensionInfos.length; index++) {
 			const info = extensionInfos[index];
 			if (areSameExtensions({ id: info.id, uuid: info.uuid }, extension.identifier)) {
 				return index;
@@ -700,6 +695,31 @@ export abstract class AbstractExtensionGalleryService implements IExtensionGalle
 		}
 
 		return undefined;
+	}
+
+	private shouldPreferMarketplaceExtension(current: IGalleryExtension, candidate: IGalleryExtension): boolean {
+		const currentValid = semver.valid(current.version);
+		const candidateValid = semver.valid(candidate.version);
+
+		if (currentValid && candidateValid) {
+			const cmp = semver.compare(candidate.version, current.version);
+			if (cmp > 0) {
+				return true;
+			}
+			if (cmp < 0) {
+				return false;
+			}
+		} else {
+			const cmp = candidate.version.localeCompare(current.version, undefined, { numeric: true, sensitivity: 'base' });
+			if (cmp > 0) {
+				return true;
+			}
+			if (cmp < 0) {
+				return false;
+			}
+		}
+
+		return candidate.lastUpdated > current.lastUpdated;
 	}
 
 	private async getResourceApi(marketplace: IExtensionGalleryMarketplace): Promise<{ uri: string; fallback?: string } | undefined> {

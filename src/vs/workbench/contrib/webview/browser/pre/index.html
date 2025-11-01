@@ -54,6 +54,18 @@
 		};
 
 		const searchParams = new URL(location.toString()).searchParams;
+	let parentDebug = false;
+	try {
+		parentDebug = !!(globalThis.parent && globalThis.parent !== globalThis && globalThis.parent.__openvscodeWebviewDebug === true);
+	} catch (error) {
+		parentDebug = false;
+	}
+	const debugEnabled = searchParams.get('debug') === '1' || searchParams.has('debug') || globalThis.__openvscodeWebviewDebug === true || parentDebug;
+		const debugLog = (...args) => {
+			if (debugEnabled) {
+				console.log(...args);
+			}
+		};
 		const ID = searchParams.get('id');
 		const webviewOrigin = searchParams.get('origin');
 		const parentOrigin = searchParams.get('parentOrigin');
@@ -847,8 +859,8 @@
 						if (event.data.version === expectedWorkerVersion) {
 							return resolve();
 						} else {
-							console.log(`Found unexpected service worker version. Found: ${event.data.version}. Expected: ${expectedWorkerVersion}`);
-							console.log(`Attempting to reload service worker`);
+							debugLog(`Found unexpected service worker version. Found: ${event.data.version}. Expected: ${expectedWorkerVersion}`);
+							debugLog(`Attempting to reload service worker`);
 
 							// If we have the wrong version, try once (and only once) to unregister and re-register
 							// Note that `.update` doesn't seem to work desktop electron at the moment so we use
@@ -933,7 +945,7 @@
 					navigatorServiceWorker.ready.then(() => {
 			console.warn('[Webview] navigator.serviceWorker.ready resolved', { controller: navigatorServiceWorker.controller && navigatorServiceWorker.controller.scriptURL, scope: navigatorServiceWorker.controller && navigatorServiceWorker.controller.scope });
 						if (!controllerEstablished && readyRegistration?.active) {
-							console.log('[Webview] Posting version message to active worker (pre-controller)', {
+							debugLog('[Webview] Posting version message to active worker (pre-controller)', {
 								scriptURL: readyRegistration.active.scriptURL
 							});
 							postVersionMessage(readyRegistration.active);
@@ -1014,7 +1026,7 @@
 							handler(e, e.data.args);
 						}
 					} else {
-						console.log('no handler for ', e);
+						debugLog('no handler for ', e);
 					}
 				};
 			}
@@ -1652,7 +1664,7 @@
 							encoded: encodedBase,
 							rewritten: rewrittenHref
 						};
-						console.log('[WebviewPre] normalized base href', {
+						debugLog('[WebviewPre] normalized base href', {
 							original: rawHref,
 							sanitized: sanitizedHref,
 							decoded: decodedSanitized,
@@ -1925,7 +1937,7 @@
 
 					// Workaround for https://bugs.chromium.org/p/chromium/issues/detail?id=978325
 					setTimeout(() => {
-				console.log('[WebviewPre] onFrameLoaded start', { id: ID, title: data.title });
+				debugLog('[WebviewPre] onFrameLoaded start', { id: ID, title: data.title });
 				const targetDocument = contentDocument;
 				if (!targetDocument || !newDocument || !newDocument.documentElement) {
 					console.warn('[WebviewPre] missing target or source document', {
@@ -2042,7 +2054,7 @@
 
 				targetHtml.replaceChildren(newHead, newBody, ...extraNodes);
 				targetDocument.title = newDocument.title || '';
-				console.log('[WebviewPre] DOM sync complete', { id: ID, title: data.title });
+				debugLog('[WebviewPre] DOM sync complete', { id: ID, title: data.title });
 
 						hookupOnLoadHandlers(newFrame);
 						perfMark('content/wroteInnerContent')
@@ -2073,7 +2085,7 @@
 				} else {
 				assertIsDefined(newFrame.contentWindow).addEventListener('DOMContentLoaded', e => {
 					const contentDocument = e.target ? (/** @type {HTMLDocument} */ (e.target)) : undefined;
-					console.log('[WebviewPre] DOMContentLoaded fired', { id: ID, title: data.title });
+					debugLog('[WebviewPre] DOMContentLoaded fired', { id: ID, title: data.title });
 					onFrameLoaded(assertIsDefined(contentDocument));
 				});
 				}

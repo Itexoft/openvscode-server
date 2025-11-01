@@ -10,7 +10,6 @@ import { memoize } from '../common/decorators.js';
 import { Event as EventUtils } from '../common/event.js';
 import { Disposable, IDisposable, markAsSingleton, toDisposable } from '../common/lifecycle.js';
 import { LinkedList } from '../common/linkedList.js';
-import * as platform from '../common/platform.js';
 
 export namespace EventType {
 	export const Tap = '-monaco-gesturetap';
@@ -101,18 +100,18 @@ export class Gesture extends Disposable {
 		this.activeTouches = {};
 		this.handle = null;
 		this._lastSetTapCountTime = 0;
-		this.usePointerEvents = platform.isIOS && BrowserFeatures.pointerEvents;
+		this.usePointerEvents = BrowserFeatures.pointerEvents;
 
 		this._register(EventUtils.runAndSubscribe(DomUtils.onDidRegisterWindow, ({ window, disposables }) => {
 			if (this.usePointerEvents) {
-				disposables.add(DomUtils.addDisposableListener(window.document, DomUtils.EventType.POINTER_DOWN, (e: PointerEvent) => this.onPointerDown(e), { passive: false }));
+				disposables.add(DomUtils.addDisposableListener(window.document, DomUtils.EventType.POINTER_DOWN, (e: PointerEvent) => this.onPointerDown(e), { passive: true }));
 				disposables.add(DomUtils.addDisposableListener(window.document, DomUtils.EventType.POINTER_UP, (e: PointerEvent) => this.onPointerUp(window, e)));
 				disposables.add(DomUtils.addDisposableListener(window.document, 'pointercancel', (e: PointerEvent) => this.onPointerUp(window, e)));
-				disposables.add(DomUtils.addDisposableListener(window.document, DomUtils.EventType.POINTER_MOVE, (e: PointerEvent) => this.onPointerMove(e), { passive: false }));
+				disposables.add(DomUtils.addDisposableListener(window.document, DomUtils.EventType.POINTER_MOVE, (e: PointerEvent) => this.onPointerMove(e), { passive: true }));
 			} else {
-				disposables.add(DomUtils.addDisposableListener(window.document, 'touchstart', (e: TouchEvent) => this.onTouchStart(e), { passive: false }));
+				disposables.add(DomUtils.addDisposableListener(window.document, 'touchstart', (e: TouchEvent) => this.onTouchStart(e), { passive: true }));
 				disposables.add(DomUtils.addDisposableListener(window.document, 'touchend', (e: TouchEvent) => this.onTouchEnd(window, e)));
-				disposables.add(DomUtils.addDisposableListener(window.document, 'touchmove', (e: TouchEvent) => this.onTouchMove(e), { passive: false }));
+				disposables.add(DomUtils.addDisposableListener(window.document, 'touchmove', (e: TouchEvent) => this.onTouchMove(e), { passive: true }));
 			}
 		}, { window: mainWindow, disposables: this._store }));
 	}
@@ -125,8 +124,18 @@ export class Gesture extends Disposable {
 			Gesture.INSTANCE = markAsSingleton(new Gesture());
 		}
 
+		const hadInlineTouchAction = element.style.touchAction.length > 0;
+		if (!hadInlineTouchAction) {
+			element.style.touchAction = 'none';
+		}
+
 		const remove = Gesture.INSTANCE.targets.push(element);
-		return toDisposable(remove);
+		return toDisposable(() => {
+			remove();
+			if (!hadInlineTouchAction) {
+				element.style.removeProperty('touch-action');
+			}
+		});
 	}
 
 	public static ignoreTarget(element: HTMLElement): IDisposable {
@@ -168,7 +177,6 @@ export class Gesture extends Disposable {
 		this.handleTouchStart(this.readTouchList(e.targetTouches), timestamp);
 
 		if (this.dispatched) {
-			e.preventDefault();
 			e.stopPropagation();
 			this.dispatched = false;
 		}
@@ -180,7 +188,6 @@ export class Gesture extends Disposable {
 		this.handleTouchEnd(this.readTouchList(e.changedTouches), timestamp, targetWindow);
 
 		if (this.dispatched) {
-			e.preventDefault();
 			e.stopPropagation();
 			this.dispatched = false;
 		}
@@ -280,7 +287,6 @@ export class Gesture extends Disposable {
 		this.handleTouchMove(this.readTouchList(e.changedTouches), timestamp);
 
 		if (this.dispatched) {
-			e.preventDefault();
 			e.stopPropagation();
 			this.dispatched = false;
 		}
@@ -441,7 +447,6 @@ export class Gesture extends Disposable {
 		this.handleTouchStart([touch], timestamp);
 
 		if (this.dispatched) {
-			e.preventDefault();
 			e.stopPropagation();
 			this.dispatched = false;
 		}
@@ -464,7 +469,6 @@ export class Gesture extends Disposable {
 		this.handleTouchMove([touch], Date.now());
 
 		if (this.dispatched) {
-			e.preventDefault();
 			e.stopPropagation();
 			this.dispatched = false;
 		}
@@ -486,7 +490,6 @@ export class Gesture extends Disposable {
 		this.handleTouchEnd([touch], Date.now(), resolvedWindow);
 
 		if (this.dispatched) {
-			e.preventDefault();
 			e.stopPropagation();
 			this.dispatched = false;
 		}

@@ -708,16 +708,48 @@ export class WebClientServer {
 
 		const proposedApi = this._environmentService.args['enable-proposed-api'];
 		if (proposedApi?.length) {
-			productConfiguration.extensionsEnabledWithApiProposalVersion ??= [];
-			productConfiguration.extensionsEnabledWithApiProposalVersion.push(...proposedApi);
+			const normalizedProposedApi = proposedApi
+				.map(value => typeof value === 'string' ? value.trim() : value === undefined || value === null ? '' : String(value))
+				.filter(value => value && value !== '*');
+			if (normalizedProposedApi.length) {
+				productConfiguration.extensionsEnabledWithApiProposalVersion ??= [];
+				productConfiguration.extensionsEnabledWithApiProposalVersion.push(...normalizedProposedApi);
+			}
 		}
 
 		if (!this._environmentService.isBuilt) {
 			try {
 				const productOverrides = JSON.parse((await promises.readFile(join(APP_ROOT, 'product.overrides.json'))).toString());
-				Object.assign(productConfiguration, productOverrides);
-			} catch (err) {/* Ignore Error */ }
-		}
+			Object.assign(productConfiguration, productOverrides);
+		} catch (err) {/* Ignore Error */ }
+	}
+
+		const parseBoolean = (value: unknown): boolean => {
+			if (typeof value === 'string') {
+				const normalized = value.trim().toLowerCase();
+				return normalized === '1' || normalized === 'true' || normalized === 'yes';
+			}
+
+			if (typeof value === 'number') {
+				return value !== 0;
+			}
+
+			if (typeof value === 'boolean') {
+				return value;
+			}
+
+			return false;
+		};
+
+		const verboseConsoleFlag = parseBoolean(this._environmentService.args['openvscode-verbose-console']);
+		const verboseConsoleEnv = parseBoolean(process.env.OPENVSCODE_VERBOSE_CONSOLE);
+		const webviewDebugFlag = parseBoolean(this._environmentService.args['openvscode-webview-debug']);
+		const webviewDebugEnv = parseBoolean(process.env.OPENVSCODE_WEBVIEW_DEBUG);
+
+		const openvscodeConfiguration = {
+			verboseConsole: verboseConsoleFlag || verboseConsoleEnv,
+			webviewDebug: webviewDebugFlag || webviewDebugEnv,
+		};
 
 		const workbenchWebConfiguration = {
 			remoteAuthority,
@@ -731,7 +763,8 @@ export class WebClientServer {
 			productConfiguration,
 			webviewEndpoint,
 			webviewServiceWorkerVersion,
-			callbackRoute: callbackRoute
+			callbackRoute: callbackRoute,
+			openvscode: openvscodeConfiguration
 		};
 
 		const cookies = cookie.parse(req.headers.cookie || '');

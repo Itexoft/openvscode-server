@@ -418,7 +418,6 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 		if (!isFirefox) {
 			allowRules.push('clipboard-read', 'clipboard-write');
 		}
-		allowRules.push('storage-access-by-user-activation');
 		element.setAttribute('allow', allowRules.join('; '));
 
 		element.style.border = 'none';

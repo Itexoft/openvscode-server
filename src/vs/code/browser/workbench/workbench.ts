@@ -186,6 +186,110 @@ class ServerKeyedAESCrypto implements ISecretStorageCrypto {
 	}
 }
 
+const CODICON_PRELOAD_SELECTOR = 'link[rel="preload"][href*="codicon.ttf"]';
+
+function removeCodiconPreloadLinks(): void {
+	if (typeof document === 'undefined') {
+		return;
+	}
+
+	const cleanup = () => {
+		document.querySelectorAll<HTMLLinkElement>(CODICON_PRELOAD_SELECTOR).forEach(link => {
+			link.parentElement?.removeChild(link);
+		});
+	};
+
+	if (document.readyState === 'loading') {
+		document.addEventListener('DOMContentLoaded', () => cleanup(), { once: true });
+	} else {
+		cleanup();
+	}
+}
+
+removeCodiconPreloadLinks();
+
+const REMOTE_WEB_RESOURCE_PREFIXES = [
+	'vscode-remote-resource?',
+	'vscode-remote-resource%3f',
+	'vscode-resource.192.',
+];
+
+function normalizePreloadLinks(): void {
+	if (typeof document === 'undefined') {
+		return;
+	}
+
+	const qualify = () => {
+		document.querySelectorAll<HTMLLinkElement>('link[rel="preload"]').forEach(link => {
+			const href = link.getAttribute('href');
+			if (!href) {
+				return;
+			}
+
+			const normalizedHref = href.toLowerCase();
+			if (!REMOTE_WEB_RESOURCE_PREFIXES.some(prefix => normalizedHref.includes(prefix))) {
+				return;
+			}
+
+			if (!link.as) {
+				const extension = (() => {
+					try {
+						const url = new URL(href, document.baseURI);
+						return url.pathname.split('.').pop()?.toLowerCase();
+					} catch {
+						return href.split('?')[0].split('.').pop()?.toLowerCase();
+					}
+				})();
+
+				if (extension === 'woff' || extension === 'woff2') {
+					link.as = 'font';
+					if (!link.type) {
+						link.type = extension === 'woff2' ? 'font/woff2' : 'font/woff';
+					}
+				}
+			}
+
+			if (link.crossOrigin !== 'use-credentials') {
+				link.crossOrigin = 'use-credentials';
+				link.setAttribute('crossorigin', 'use-credentials');
+			}
+		});
+	};
+
+	if (document.readyState === 'loading') {
+		document.addEventListener('DOMContentLoaded', () => qualify(), { once: true });
+	} else {
+		qualify();
+	}
+}
+
+normalizePreloadLinks();
+
+function installConsoleFilters(): void {
+	if (typeof console === 'undefined') {
+		return;
+	}
+
+	if ((globalThis as any).__openvscodeVerboseConsole === true) {
+		return;
+	}
+
+	const originalWarn = console.warn;
+	console.warn = (...args) => {
+		const [firstArg] = args;
+		if (typeof firstArg === 'string') {
+			if (
+				firstArg.includes('storage-access-by-user-activation') ||
+				firstArg.includes('An iframe which has both allow-scripts and allow-same-origin')
+			) {
+				return;
+			}
+		}
+
+		originalWarn.apply(console, args);
+	};
+}
+
 export class LocalStorageSecretStorageProvider implements ISecretStorageProvider {
 
 	private readonly storageKey = 'secrets.provider';
@@ -406,6 +510,7 @@ class WorkspaceProvider implements IWorkspaceProvider {
 	private static QUERY_PARAM_EMPTY_WINDOW = 'ew';
 	private static QUERY_PARAM_FOLDER = 'folder';
 	private static QUERY_PARAM_WORKSPACE = 'workspace';
+	private static LAST_WORKSPACE_STORAGE_KEY = 'openvscode:lastWorkspace';
 
 	private static QUERY_PARAM_PAYLOAD = 'payload';
 
@@ -464,6 +569,14 @@ class WorkspaceProvider implements IWorkspaceProvider {
 		// If no workspace is provided through the URL, check for config
 		// attribute from server
 		if (!foundWorkspace) {
+			const stored = WorkspaceProvider.readLastWorkspace();
+			if (stored !== undefined) {
+				workspace = stored;
+				foundWorkspace = true;
+			}
+		}
+
+		if (!foundWorkspace) {
 			if (config.folderUri) {
 				workspace = { folderUri: URI.revive(config.folderUri) };
 			} else if (config.workspaceUri) {
@@ -471,7 +584,10 @@ class WorkspaceProvider implements IWorkspaceProvider {
 			}
 		}
 
-		return new WorkspaceProvider(workspace, payload, config);
+		const provider = new WorkspaceProvider(workspace, payload, config);
+		WorkspaceProvider.storeLastWorkspace(workspace);
+
+		return provider;
 	}
 
 	readonly trusted = true;
@@ -528,6 +644,8 @@ class WorkspaceProvider implements IWorkspaceProvider {
 			targetHref = `${document.location.origin}${document.location.pathname}?${WorkspaceProvider.QUERY_PARAM_WORKSPACE}=${queryParamWorkspace}`;
 		}
 
+		WorkspaceProvider.storeLastWorkspace(workspace);
+
 		// Append payload if any
 		if (options?.payload) {
 			targetHref += `&${WorkspaceProvider.QUERY_PARAM_PAYLOAD}=${encodeURIComponent(JSON.stringify(options.payload))}`;
@@ -550,6 +668,69 @@ class WorkspaceProvider implements IWorkspaceProvider {
 		}
 
 		return encodeURIComponent(uri.toString(true));
+	}
+
+	private static storeLastWorkspace(workspace: IWorkspace | undefined): void {
+		if (typeof localStorage === 'undefined') {
+			return;
+		}
+
+		try {
+			if (!workspace) {
+				localStorage.setItem(WorkspaceProvider.LAST_WORKSPACE_STORAGE_KEY, JSON.stringify({ kind: 'empty' }));
+			} else if (isFolderToOpen(workspace)) {
+				localStorage.setItem(WorkspaceProvider.LAST_WORKSPACE_STORAGE_KEY, JSON.stringify({
+					kind: 'folder',
+					uri: workspace.folderUri.toString(true)
+				}));
+			} else if (isWorkspaceToOpen(workspace)) {
+				localStorage.setItem(WorkspaceProvider.LAST_WORKSPACE_STORAGE_KEY, JSON.stringify({
+					kind: 'workspace',
+					uri: workspace.workspaceUri.toString(true)
+				}));
+			}
+		} catch (error) {
+			console.warn('[WorkspaceProvider] Failed to persist last workspace', error);
+		}
+	}
+
+	private static readLastWorkspace(): IWorkspace | undefined {
+		if (typeof localStorage === 'undefined') {
+			return undefined;
+		}
+
+		try {
+			const raw = localStorage.getItem(WorkspaceProvider.LAST_WORKSPACE_STORAGE_KEY);
+			if (!raw) {
+				return undefined;
+			}
+
+			const data = JSON.parse(raw);
+			if (!data || typeof data !== 'object' || typeof data.kind !== 'string') {
+				return undefined;
+			}
+
+			if (data.kind === 'empty') {
+				return undefined;
+			}
+
+			if (typeof data.uri !== 'string' || !data.uri) {
+				return undefined;
+			}
+
+			const uri = URI.parse(data.uri);
+			if (data.kind === 'folder') {
+				return { folderUri: uri };
+			}
+
+			if (data.kind === 'workspace') {
+				return { workspaceUri: uri };
+			}
+		} catch (error) {
+			console.warn('[WorkspaceProvider] Failed to restore last workspace', error);
+		}
+
+		return undefined;
 	}
 
 	private isSame(workspaceA: IWorkspace, workspaceB: IWorkspace): boolean {
@@ -602,7 +783,16 @@ function readCookie(name: string): string | undefined {
 	if (!configElement || !configElementAttribute) {
 		throw new Error('Missing web configuration element');
 	}
-	const originalConfig: IWorkbenchConstructionOptions & { folderUri?: UriComponents; workspaceUri?: UriComponents; callbackRoute: string } = JSON.parse(configElementAttribute);
+	const originalConfig: IWorkbenchConstructionOptions & { folderUri?: UriComponents; workspaceUri?: UriComponents; callbackRoute: string; openvscode?: { verboseConsole?: boolean; webviewDebug?: boolean } } = JSON.parse(configElementAttribute);
+	const openvscodeConfig = originalConfig.openvscode ?? {};
+	if (openvscodeConfig.verboseConsole) {
+		(globalThis as any).__openvscodeVerboseConsole = true;
+	}
+	if (openvscodeConfig.webviewDebug) {
+		(globalThis as any).__openvscodeWebviewDebug = true;
+	}
+	installConsoleFilters();
+	delete (originalConfig as any).openvscode;
 	const secretStorageKeyPath = readCookie('vscode-secret-key-path');
 	const secretStorageCrypto = secretStorageKeyPath && ServerKeyedAESCrypto.supported()
 		? new ServerKeyedAESCrypto(secretStorageKeyPath) : new TransparentCrypto();

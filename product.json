@@ -1157,7 +1157,7 @@
 		"serviceUrl": "https://open-vsx.org/vscode/gallery",
 		"itemUrl": "https://open-vsx.org/vscode/item",
 		"resourceUrlTemplate": "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}",
-		"extensionUrlTemplate": "https://open-vsx.org/vscode/gallery/{publisher}/{name}/latest",
+		"extensionUrlTemplate": "",
 		"controlUrl": "",
 		"recommendationsUrl": "",
 		"nlsBaseUrl": "",
@@ -1171,7 +1171,7 @@
 			"itemUrl": "https://open-vsx.org/vscode/item",
 			"publisherUrl": "https://open-vsx.org/vscode/publisher",
 			"resourceUrlTemplate": "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}",
-			"extensionUrlTemplate": "https://open-vsx.org/vscode/gallery/{publisher}/{name}/latest",
+			"extensionUrlTemplate": "",
 			"controlUrl": "",
 			"nlsBaseUrl": ""
 		},
