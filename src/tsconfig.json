@@ -27,12 +27,23 @@
 	},
 	"include": [
 		"./*.ts",
-		"./typings",
+		"typings/**/*.d.ts",
 		"./vs/**/*.ts",
 		"./vscode-dts/vscode.proposed.*.d.ts",
 		"./vscode-dts/vscode.d.ts"
 	],
 	"exclude": [
 		"vs/workbench/contrib/webview/browser/pre/service-worker.js"
+	],
+	"files": [
+		"./typings/base-common.d.ts",
+		"./typings/crypto.d.ts",
+		"./typings/css.d.ts",
+		"./typings/editContext.d.ts",
+		"./typings/thenable.d.ts",
+		"./typings/vscode-globals-nls.d.ts",
+		"./typings/vscode-globals-product.d.ts",
+		"./typings/vscode-globals-ttp.d.ts",
+		"./typings/vscode-lib-globals.d.ts"
 	]
 }

@@ -37,6 +37,8 @@ jobs:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
       npm_config_arch: ${{ matrix.vscode_arch }}
       VSCODE_ARCH: ${{ matrix.vscode_arch }}
+      VSCODE_EXTENSIONS_PACKAGER_CONCURRENCY: "1"
+      NODE_OPTIONS: --max-old-space-size=4096
 
     steps:
       - uses: actions/checkout@v4
@@ -93,6 +95,68 @@ jobs:
           NODE
         shell: bash
 
+      - name: stage runtime deps for bundle (posix)
+        if: matrix.platform != 'win32'
+        run: |
+          set -euxo pipefail
+
+          declare -a core_pkgs=(
+            "@vscode/ripgrep"
+            "@vscode/proxy-agent"
+            "vscode-regexpp"
+            "undici"
+            "undici-types"
+          )
+
+          build_cache=".build/runtime-deps/node_modules"
+          mkdir -p "$build_cache"
+
+          for pkg in "${core_pkgs[@]}"; do
+            if [ ! -d "node_modules/${pkg}" ]; then
+              echo "FATAL: runtime dependency ${pkg} missing under node_modules"
+              exit 1
+            fi
+            mkdir -p "$build_cache/$(dirname "${pkg}")"
+            rsync -a "node_modules/${pkg}/" "$build_cache/${pkg}/"
+          done
+
+          mkdir -p ".build/runtime-deps"
+          if [ -f "diagnostics-hooks.js" ]; then
+            cp diagnostics-hooks.js ".build/runtime-deps/diagnostics-hooks.js"
+          else
+            printf '%s\n' '// Auto-generated stub: diagnostics hooks disabled' 'module.exports = {};' > ".build/runtime-deps/diagnostics-hooks.js"
+          fi
+
+      - name: stage runtime deps for bundle (windows)
+        if: matrix.platform == 'win32'
+        shell: pwsh
+        run: |
+          $corePkgs = "@vscode/ripgrep","@vscode/proxy-agent","vscode-regexpp","undici","undici-types"
+
+          $buildCache = ".build/runtime-deps/node_modules"
+          New-Item -ItemType Directory -Force -Path $buildCache | Out-Null
+
+          foreach ($pkg in $corePkgs) {
+            $normalized = $pkg.Replace('/', [IO.Path]::DirectorySeparatorChar)
+            $source = Join-Path "node_modules" $normalized
+            if (-not (Test-Path $source)) {
+              Write-Error "FATAL: runtime dependency $pkg missing under node_modules"
+              exit 1
+            }
+            $dest = Join-Path $buildCache $normalized
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            robocopy $source $dest /E /NFL /NDL /NJH /NJS /NC /NS > $null
+          }
+
+          $runtimeDir = ".build/runtime-deps"
+          New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+          $diagTarget = Join-Path $runtimeDir "diagnostics-hooks.js"
+          if (Test-Path "diagnostics-hooks.js") {
+            Copy-Item "diagnostics-hooks.js" $diagTarget -Force
+          } else {
+            Set-Content -Path $diagTarget -Value "// Auto-generated stub: diagnostics hooks disabled`nmodule.exports = {};" -Encoding UTF8
+          }
+
       - if: matrix.platform != 'win32'
         run: |
           npm run gulp vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}-min
@@ -100,6 +164,14 @@ jobs:
             mkdir -p ../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}/extensions ../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}/static/extensions
             rsync -a ./.build/web/extensions/ ../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}/extensions/ || true
             rsync -a ./.build/web/extensions/ ../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}/static/extensions/ || true
+          fi
+          if [ -d ".build/runtime-deps/node_modules" ] && [ -d "../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}" ]; then
+            mkdir -p ../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}/node_modules ../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}/static/node_modules
+            rsync -a .build/runtime-deps/node_modules/ ../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}/node_modules/
+            rsync -a .build/runtime-deps/node_modules/ ../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}/static/node_modules/
+          fi
+          if [ -f ".build/runtime-deps/diagnostics-hooks.js" ] && [ -d "../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}" ]; then
+            cp .build/runtime-deps/diagnostics-hooks.js ../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}/diagnostics-hooks.js
           fi
           mv ../vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }} ../vscode-server-${{ matrix.platform }}-${{ matrix.vscode_arch }}
           tar -czf ${{ matrix.artifact }}.${{ matrix.archive }} -C .. vscode-server-${{ matrix.platform }}-${{ matrix.vscode_arch }}
@@ -115,6 +187,21 @@ jobs:
               Copy-Item ".build/web/extensions/*" "$target\extensions" -Recurse -Force -ErrorAction SilentlyContinue
               Copy-Item ".build/web/extensions/*" "$target\static\extensions" -Recurse -Force -ErrorAction SilentlyContinue
             }
+          }
+          $deps = ".build/runtime-deps\node_modules"
+          if (Test-Path $deps) {
+            $target = "..\vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}"
+            if (Test-Path $target) {
+              New-Item -ItemType Directory -Force -Path "$target\node_modules" | Out-Null
+              New-Item -ItemType Directory -Force -Path "$target\static\node_modules" | Out-Null
+              robocopy $deps "$target\node_modules" /E /NFL /NDL /NJH /NJS /NC /NS > $null
+              robocopy $deps "$target\static\node_modules" /E /NFL /NDL /NJH /NJS /NC /NS > $null
+            }
+          }
+          $diag = ".build/runtime-deps\diagnostics-hooks.js"
+          if (Test-Path $diag) {
+            $target = "..\vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }}\diagnostics-hooks.js"
+            Copy-Item $diag $target -Force
           }
           Move-Item ..\\vscode-reh-${{ matrix.platform }}-${{ matrix.vscode_arch }} ..\\vscode-server-${{ matrix.platform }}-${{ matrix.vscode_arch }}
           Compress-Archive -Path ..\\vscode-server-${{ matrix.platform }}-${{ matrix.vscode_arch }} -DestinationPath ${{ matrix.artifact }}.${{ matrix.archive }}

@@ -30,6 +30,7 @@ const vzip = require('gulp-vinyl-zip');
 const root = path.dirname(path.dirname(__dirname));
 const commit = getVersion(root);
 const sourceMappingURLBase = `https://main.vscode-cdn.net/sourcemaps/${commit}`;
+const extensionsPackagingConcurrency = Math.max(1, Number(process.env['VSCODE_EXTENSIONS_PACKAGER_CONCURRENCY'] ?? process.env['VSCODE_EXTENSIONS_WEBPACK_CONCURRENCY'] ?? '4'));
 
 function minifyExtensionResources(input: Stream): Stream {
 	const jsonFilter = filter(['**/*.json', '**/*.code-snippets'], { restore: true });
@@ -87,6 +88,60 @@ function fromLocal(extensionPath: string, forWeb: boolean, disableMangle: boolea
 	return input;
 }
 
+function mergeStreamsWithConcurrencyLimit(streamFactories: Array<() => Stream>, concurrency: number): Stream {
+	const output = es.through();
+	let index = 0;
+	let active = 0;
+	let ended = false;
+
+	const maybeEnd = () => {
+		if (!ended && active === 0 && index >= streamFactories.length) {
+			ended = true;
+			output.emit('end');
+		}
+	};
+
+	const pump = () => {
+		if (ended) {
+			return;
+		}
+		while (active < concurrency && index < streamFactories.length) {
+			let stream: Stream;
+			try {
+				stream = streamFactories[index++]();
+			} catch (error) {
+				output.emit('error', error);
+				continue;
+			}
+			active++;
+			let settled = false;
+			const settle = () => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				active--;
+				maybeEnd();
+				pump();
+			};
+			stream.on('error', err => output.emit('error', err));
+			stream.on('end', settle);
+			stream.on('close', settle);
+			stream.pipe(output, { end: false });
+		}
+		maybeEnd();
+	};
+
+	process.nextTick(() => {
+		if (streamFactories.length === 0) {
+			output.emit('end');
+		} else {
+			pump();
+		}
+	});
+
+	return output;
+}
 
 function fromLocalWebpack(extensionPath: string, webpackConfigFileName: string, disableMangle: boolean): Stream {
 	const vsce = require('@vscode/vsce') as typeof import('@vscode/vsce');
@@ -429,13 +484,12 @@ function doPackageLocalExtensionsStream(forWeb: boolean, disableMangle: boolean,
 			.filter(({ name }) => builtInExtensions.every(b => b.name !== name))
 			.filter(({ manifestPath }) => (forWeb ? isWebExtension(require(manifestPath)) : true))
 	);
+	const extensionStreamFactories = localExtensionsDescriptions.map(extension => {
+		return () => fromLocal(extension.path, forWeb, disableMangle)
+			.pipe(rename(p => p.dirname = `extensions/${extension.name}/${p.dirname}`));
+	});
 	const localExtensionsStream = minifyExtensionResources(
-		es.merge(
-			...localExtensionsDescriptions.map(extension => {
-				return fromLocal(extension.path, forWeb, disableMangle)
-					.pipe(rename(p => p.dirname = `extensions/${extension.name}/${p.dirname}`));
-			})
-		)
+		mergeStreamsWithConcurrencyLimit(extensionStreamFactories, extensionsPackagingConcurrency)
 	);
 
 	let result: Stream;

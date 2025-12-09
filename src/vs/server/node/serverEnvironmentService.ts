@@ -28,6 +28,11 @@ export const serverOptions: OptionDescriptions<Required<ServerParsedArgs>> = {
 	'disable-websocket-compression': { type: 'boolean' },
 	'print-startup-performance': { type: 'boolean' },
 	'print-ip-address': { type: 'boolean' },
+	'tls-cert': { type: 'string', cat: 'o', args: 'path', description: nls.localize('tls-cert', "Path to a PEM encoded certificate file to enable TLS.") },
+	'tls-key': { type: 'string', cat: 'o', args: 'path', description: nls.localize('tls-key', "Path to the PEM encoded private key matching --tls-cert.") },
+	'tls-ca': { type: 'string[]', cat: 'o', args: 'path', description: nls.localize('tls-ca', "Optional path to a PEM encoded certificate authority bundle. May be specified multiple times.") },
+	'tls-passphrase': { type: 'string', cat: 'o', args: 'passphrase', description: nls.localize('tls-passphrase', "Optional passphrase for the private key provided via --tls-key.") },
+	'tls-client-cert-required': { type: 'boolean', cat: 'o', description: nls.localize('tls-client-cert-required', "Require connecting clients to present a valid certificate. Must be used together with --tls-ca.") },
 	'accept-server-license-terms': { type: 'boolean', cat: 'o', description: nls.localize('acceptLicenseTerms', "If set, the user accepts the server license terms and the server will be started without a user prompt.") },
 	'server-data-dir': { type: 'string', cat: 'o', description: nls.localize('serverDataDir', "Specifies the directory that server data is kept in.") },
 	'telemetry-level': { type: 'string', cat: 'o', args: 'level', description: nls.localize('telemetry-level', "Sets the initial telemetry level. Valid levels are: 'off', 'crash', 'error' and 'all'. If not specified, the server will send telemetry until a client connects, it will then use the clients telemetry setting. Setting this to 'off' is equivalent to --disable-telemetry") },
@@ -87,6 +92,8 @@ export const serverOptions: OptionDescriptions<Required<ServerParsedArgs>> = {
 	'proxy-host': { type: 'string' },
 	'proxy-port': { type: 'string' },
 	'without-browser-env-var': { type: 'boolean' },
+	'openvscode-verbose-console': { type: 'boolean' },
+	'openvscode-webview-debug': { type: 'boolean' },
 
 	/* ----- server cli ----- */
 
@@ -147,6 +154,11 @@ export interface ServerParsedArgs {
 
 	'print-startup-performance'?: boolean;
 	'print-ip-address'?: boolean;
+	'tls-cert'?: string;
+	'tls-key'?: string;
+	'tls-ca'?: string[];
+	'tls-passphrase'?: string;
+	'tls-client-cert-required'?: boolean;
 
 	'accept-server-license-terms': boolean;
 
@@ -217,6 +229,8 @@ export interface ServerParsedArgs {
 	'proxy-host'?: string;
 	'proxy-port'?: string;
 	'without-browser-env-var'?: boolean;
+	'openvscode-verbose-console'?: boolean;
+	'openvscode-webview-debug'?: boolean;
 
 	/* ----- server cli ----- */
 	help: boolean;
@@ -234,6 +248,7 @@ export interface IServerEnvironmentService extends INativeEnvironmentService {
 	readonly machineSettingsResource: URI;
 	readonly mcpResource: URI;
 	readonly args: ServerParsedArgs;
+	readonly globalStorageHome?: URI;
 }
 
 export class ServerEnvironmentService extends NativeEnvironmentService implements IServerEnvironmentService {

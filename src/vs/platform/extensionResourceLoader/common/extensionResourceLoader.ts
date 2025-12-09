@@ -86,15 +86,15 @@ export abstract class AbstractExtensionResourceLoaderService extends Disposable 
 		this._initPromise = this._init();
 	}
 
-	private async _init(): Promise<void> {
-		try {
-			const manifest = await this._extensionGalleryManifestService.getExtensionGalleryManifest();
-			this.resolve(manifest);
-			this._register(this._extensionGalleryManifestService.onDidChangeExtensionGalleryManifest(() => this.resolve(manifest)));
-		} catch (error) {
-			this._logService.error(error);
+		private async _init(): Promise<void> {
+			try {
+				const manifest = await this._extensionGalleryManifestService.getExtensionGalleryManifest();
+				this.resolve(manifest);
+				this._register(this._extensionGalleryManifestService.onDidChangeExtensionGalleryManifest(updatedManifest => this.resolve(updatedManifest)));
+			} catch (error) {
+				this._logService.error(error);
+			}
 		}
-	}
 
 	private resolve(manifest: IExtensionGalleryCompositeManifest | null): void {
 		const marketplace = getPrimaryExtensionGalleryMarketplace(manifest);

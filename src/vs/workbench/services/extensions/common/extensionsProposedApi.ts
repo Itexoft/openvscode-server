@@ -29,12 +29,33 @@ export class ExtensionsProposedApi {
 		@IProductService productService: IProductService
 	) {
 
-		this._envEnabledExtensions = new Set((_environmentService.extensionEnabledProposedApi ?? []).map(id => ExtensionIdentifier.toKey(id)));
+		const rawEnvEnabledProposals = _environmentService.extensionEnabledProposedApi;
+		const isEnvArray = Array.isArray(rawEnvEnabledProposals);
 
-		this._envEnablesProposedApiForAll = true || // always enable proposed API
+		let envRequestsEnableAll = false;
+		const normalizedEnvExtensions: string[] = [];
+
+		if (isEnvArray) {
+			for (const candidate of rawEnvEnabledProposals) {
+				const candidateStr = typeof candidate === 'string' ? candidate : (candidate === undefined || candidate === null ? '' : String(candidate));
+				const trimmed = candidateStr.trim();
+
+				if (!trimmed || trimmed === '*') {
+					envRequestsEnableAll = true;
+					continue;
+				}
+
+				normalizedEnvExtensions.push(trimmed);
+			}
+		}
+
+		this._envEnabledExtensions = new Set(normalizedEnvExtensions.map(id => ExtensionIdentifier.toKey(id)));
+
+		this._envEnablesProposedApiForAll =
+			envRequestsEnableAll ||
 			!_environmentService.isBuilt || // always allow proposed API when running out of sources
 			(_environmentService.isExtensionDevelopment && productService.quality !== 'stable') || // do not allow proposed API against stable builds when developing an extension
-			(this._envEnabledExtensions.size === 0 && Array.isArray(_environmentService.extensionEnabledProposedApi)); // always allow proposed API if --enable-proposed-api is provided without extension ID
+			(this._envEnabledExtensions.size === 0 && isEnvArray); // allow all when the flag is present without explicit ids
 
 		this._productEnabledExtensions = new Map<string, ApiProposalName[]>();
 

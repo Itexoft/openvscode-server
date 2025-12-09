@@ -9,6 +9,9 @@
 import path from 'node:path';
 import esbuild from 'esbuild';
 
+const DEFAULT_TARGET = ['es2024'];
+const FALLBACK_TARGET = ['esnext'];
+
 /**
  * @typedef {Partial<import('esbuild').BuildOptions> & {
  * 	entryPoints: string[] | Record<string, string> | { in: string, out: string }[];
@@ -23,15 +26,32 @@ import esbuild from 'esbuild';
  * @param {(outDir: string) => unknown} [didBuild]
  */
 async function build(options, didBuild) {
-	await esbuild.build({
+	/** @type {import('esbuild').BuildOptions} */
+	const baseOptions = {
 		bundle: true,
 		minify: true,
 		sourcemap: false,
 		format: 'esm',
 		platform: 'browser',
-		target: ['es2024'],
+		target: DEFAULT_TARGET,
 		...options,
-	});
+	};
+
+	try {
+		await esbuild.build(baseOptions);
+	} catch (error) {
+		const currentTarget = Array.isArray(baseOptions.target) ? baseOptions.target.join(',') : String(baseOptions.target ?? '');
+		if (shouldFallbackTarget(error, currentTarget)) {
+			const fallbackOptions = {
+				...baseOptions,
+				target: FALLBACK_TARGET,
+			};
+			console.warn(`[esbuild] Falling back from target "${currentTarget}" to "${FALLBACK_TARGET.join(',')}"`);
+			await esbuild.build(fallbackOptions);
+		} else {
+			throw error;
+		}
+	}
 
 	await didBuild?.(options.outdir);
 }
@@ -87,4 +107,21 @@ export async function run(config, args, didBuild) {
 	} else {
 		return build(resolvedOptions, didBuild).catch(() => process.exit(1));
 	}
+}
+
+/**
+ * @param {unknown} error
+ * @param {string} target
+ */
+function shouldFallbackTarget(error, target) {
+	if (!target) {
+		return false;
+	}
+	if (!(error instanceof Error) || typeof error.message !== 'string') {
+		return false;
+	}
+	if (!/Invalid target/i.test(error.message)) {
+		return false;
+	}
+	return error.message.includes(target);
 }

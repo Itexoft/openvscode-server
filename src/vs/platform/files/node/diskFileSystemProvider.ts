@@ -25,6 +25,7 @@ import { ILogService } from '../../log/common/log.js';
 import { AbstractDiskFileSystemProvider, IDiskFileSystemProviderOptions } from '../common/diskFileSystemProvider.js';
 import { UniversalWatcherClient } from './watcher/watcherClient.js';
 import { NodeJSWatcherClient } from './watcher/nodejs/nodejsClient.js';
+import { addUNCHostToAllowlist, getUNCHost } from '../../../base/node/unc.js';
 
 export class DiskFileSystemProvider extends AbstractDiskFileSystemProvider implements
 	IFileSystemProviderWithFileReadWriteCapability,
@@ -44,6 +45,19 @@ export class DiskFileSystemProvider extends AbstractDiskFileSystemProvider imple
 		options?: IDiskFileSystemProviderOptions
 	) {
 		super(logService, options);
+	}
+
+	protected override toFilePath(resource: URI): string {
+		const filePath = super.toFilePath(resource);
+
+		if (isWindows) {
+			const uncHost = getUNCHost(filePath);
+			if (uncHost) {
+				addUNCHostToAllowlist(uncHost);
+			}
+		}
+
+		return filePath;
 	}
 
 	//#region File Capabilities
@@ -109,7 +123,8 @@ export class DiskFileSystemProvider extends AbstractDiskFileSystemProvider imple
 
 	async readdir(resource: URI): Promise<[string, FileType][]> {
 		try {
-			const children = await Promises.readdir(this.toFilePath(resource), { withFileTypes: true });
+			const filePath = this.toFilePath(resource);
+			const children = await Promises.readdir(filePath, { withFileTypes: true });
 
 			const result: [string, FileType][] = [];
 			await Promise.all(children.map(async child => {
@@ -118,7 +133,7 @@ export class DiskFileSystemProvider extends AbstractDiskFileSystemProvider imple
 					if (child.isSymbolicLink()) {
 						type = (await this.stat(joinPath(resource, child.name))).type; // always resolve target the link points to if any
 					} else {
-						type = this.toType(child);
+						type = await this.resolveChildType(resource, child);
 					}
 
 					result.push([child.name, type]);
@@ -126,6 +141,15 @@ export class DiskFileSystemProvider extends AbstractDiskFileSystemProvider imple
 					this.logService.trace(error); // ignore errors for individual entries that can arise from permission denied
 				}
 			}));
+
+			if (process.env['OPENVSCODE_FS_DEBUG'] === '1') {
+				try {
+					const details = result.map(([name, type]) => `${name}:${type}`).join(', ');
+					this.logService.info(`[DiskFileSystemProvider] readdir(${filePath}) => [${details}]`);
+				} catch (error) {
+					this.logService.trace('[DiskFileSystemProvider] readdir debug logging failed', error);
+				}
+			}
 
 			return result;
 		} catch (error) {
@@ -155,6 +179,24 @@ export class DiskFileSystemProvider extends AbstractDiskFileSystemProvider imple
 		}
 
 		return type;
+	}
+
+	private resolveChildType(resource: URI, entry: IDirent): Promise<FileType> {
+		return (async () => {
+			let type = this.toType(entry);
+
+			// On some network file systems (SMB/NFS) the dirent can be `DT_UNKNOWN`.
+			// In that case we fall back to a full stat call to determine the type.
+			if (type === FileType.Unknown) {
+				try {
+					type = (await this.stat(joinPath(resource, entry.name))).type;
+				} catch (error) {
+					this.logService.debug('[DiskFileSystemProvider] Failed to resolve entry type via stat', { resource: joinPath(resource, entry.name).toString(true), error });
+				}
+			}
+
+			return type;
+		})();
 	}
 
 	//#endregion

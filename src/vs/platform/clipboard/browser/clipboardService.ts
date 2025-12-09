@@ -74,6 +74,21 @@ export class BrowserClipboardService extends Disposable implements IClipboardSer
 	}
 
 	private webKitPendingClipboardWritePromise: DeferredPromise<string> | undefined;
+	private async queryClipboardPermission(name: 'clipboard-read' | 'clipboard-write'): Promise<PermissionState | undefined> {
+		try {
+			const permissions: any = (navigator as any).permissions;
+			if (!permissions || typeof permissions.query !== 'function') {
+				return undefined;
+			}
+
+			// Clipboard permissions are missing from some lib.dom typings; cast through unknown.
+			const result = await permissions.query({ name } as unknown as PermissionDescriptor);
+			return result?.state;
+		} catch (error) {
+			this.logService.trace('BrowserClipboardService#queryClipboardPermission failed', error);
+			return undefined;
+		}
+	}
 
 	// In Safari, it has the following note:
 	//
@@ -142,10 +157,11 @@ export class BrowserClipboardService extends Disposable implements IClipboardSer
 		// as we have seen DOMExceptions in certain browsers
 		// due to security policies.
 		try {
+			await this.queryClipboardPermission('clipboard-write');
 			this.logService.trace('before navigator.clipboard.writeText');
 			return await getActiveWindow().navigator.clipboard.writeText(text);
 		} catch (error) {
-			console.error(error);
+			this.logService.warn('BrowserClipboardService#writeText navigator.clipboard failed', error);
 		}
 
 		// Fallback to textarea and execCommand solution
@@ -188,11 +204,19 @@ export class BrowserClipboardService extends Disposable implements IClipboardSer
 		// as we have seen DOMExceptions in certain browsers
 		// due to security policies.
 		try {
+			await this.queryClipboardPermission('clipboard-read');
 			const readText = await getActiveWindow().navigator.clipboard.readText();
 			this.logService.trace('BrowserClipboardService#readText text.length:', readText.length);
 			return readText;
 		} catch (error) {
-			console.error(error);
+			this.logService.warn('BrowserClipboardService#readText navigator.clipboard failed', error);
+		}
+
+		// Try to fall back to a DOM-based paste capture when async clipboard is blocked.
+		const fallbackText = await this.fallbackReadText();
+		if (fallbackText !== '') {
+			this.logService.trace('BrowserClipboardService#readText (fallback) text.length:', fallbackText.length);
+			return fallbackText;
 		}
 
 		return '';
@@ -306,5 +330,46 @@ export class BrowserClipboardService extends Disposable implements IClipboardSer
 	private clearResourcesState(): void {
 		this.resources = [];
 		this.resourcesStateHash = undefined;
+	}
+
+	private async fallbackReadText(): Promise<string> {
+		const activeDocument = getActiveDocument();
+		if (typeof activeDocument.queryCommandSupported === 'function' && !activeDocument.queryCommandSupported('paste')) {
+			return '';
+		}
+
+		const activeElement = activeDocument.activeElement;
+		const textArea: HTMLTextAreaElement = activeDocument.body.appendChild($('textarea', { 'aria-hidden': true }));
+		textArea.style.position = 'fixed';
+		textArea.style.opacity = '0';
+		textArea.style.pointerEvents = 'none';
+
+		const cleanup = () => {
+			textArea.remove();
+			if (isHTMLElement(activeElement)) {
+				activeElement.focus();
+			}
+		};
+
+		return new Promise<string>((resolve) => {
+			const onPaste = (event: ClipboardEvent) => {
+				event.preventDefault();
+				const text = event.clipboardData?.getData('text/plain') ?? '';
+				cleanup();
+				resolve(text);
+			};
+
+			textArea.addEventListener('paste', onPaste, { once: true });
+			textArea.focus();
+
+			const success = activeDocument.execCommand('paste');
+			if (!success) {
+				// execCommand can be rejected silently; avoid hanging.
+				setTimeout(() => {
+					cleanup();
+					resolve('');
+				}, 0);
+			}
+		});
 	}
 }

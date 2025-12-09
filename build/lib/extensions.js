@@ -75,6 +75,7 @@ const vzip = require('gulp-vinyl-zip');
 const root = path_1.default.dirname(path_1.default.dirname(__dirname));
 const commit = (0, getVersion_1.getVersion)(root);
 const sourceMappingURLBase = `https://main.vscode-cdn.net/sourcemaps/${commit}`;
+const extensionsPackagingConcurrency = Math.max(1, Number(process.env['VSCODE_EXTENSIONS_PACKAGER_CONCURRENCY'] ?? process.env['VSCODE_EXTENSIONS_WEBPACK_CONCURRENCY'] ?? '4'));
 function minifyExtensionResources(input) {
     const jsonFilter = (0, gulp_filter_1.default)(['**/*.json', '**/*.code-snippets'], { restore: true });
     return input
@@ -123,6 +124,58 @@ function fromLocal(extensionPath, forWeb, disableMangle) {
         });
     }
     return input;
+}
+function mergeStreamsWithConcurrencyLimit(streamFactories, concurrency) {
+    const output = event_stream_1.default.through();
+    let index = 0;
+    let active = 0;
+    let ended = false;
+    const maybeEnd = () => {
+        if (!ended && active === 0 && index >= streamFactories.length) {
+            ended = true;
+            output.emit('end');
+        }
+    };
+    const pump = () => {
+        if (ended) {
+            return;
+        }
+        while (active < concurrency && index < streamFactories.length) {
+            let stream;
+            try {
+                stream = streamFactories[index++]();
+            }
+            catch (error) {
+                output.emit('error', error);
+                continue;
+            }
+            active++;
+            let settled = false;
+            const settle = () => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                active--;
+                maybeEnd();
+                pump();
+            };
+            stream.on('error', err => output.emit('error', err));
+            stream.on('end', settle);
+            stream.on('close', settle);
+            stream.pipe(output, { end: false });
+        }
+        maybeEnd();
+    };
+    process.nextTick(() => {
+        if (streamFactories.length === 0) {
+            output.emit('end');
+        }
+        else {
+            pump();
+        }
+    });
+    return output;
 }
 function fromLocalWebpack(extensionPath, webpackConfigFileName, disableMangle) {
     const vsce = require('@vscode/vsce');
@@ -412,10 +465,11 @@ function doPackageLocalExtensionsStream(forWeb, disableMangle, native) {
         .filter(({ name }) => excludedExtensions.indexOf(name) === -1)
         .filter(({ name }) => builtInExtensions.every(b => b.name !== name))
         .filter(({ manifestPath }) => (forWeb ? isWebExtension(require(manifestPath)) : true)));
-    const localExtensionsStream = minifyExtensionResources(event_stream_1.default.merge(...localExtensionsDescriptions.map(extension => {
-        return fromLocal(extension.path, forWeb, disableMangle)
+    const extensionStreamFactories = localExtensionsDescriptions.map(extension => {
+        return () => fromLocal(extension.path, forWeb, disableMangle)
             .pipe((0, gulp_rename_1.default)(p => p.dirname = `extensions/${extension.name}/${p.dirname}`));
-    })));
+    });
+    const localExtensionsStream = minifyExtensionResources(mergeStreamsWithConcurrencyLimit(extensionStreamFactories, extensionsPackagingConcurrency));
     let result;
     if (forWeb) {
         result = localExtensionsStream;

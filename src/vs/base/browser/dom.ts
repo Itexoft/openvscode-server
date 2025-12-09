@@ -162,7 +162,21 @@ export function addDisposableListener<K extends keyof GlobalEventHandlersEventMa
 export function addDisposableListener(node: EventTarget, type: string, handler: (event: any) => void, useCapture?: boolean): IDisposable;
 export function addDisposableListener(node: EventTarget, type: string, handler: (event: any) => void, options: AddEventListenerOptions): IDisposable;
 export function addDisposableListener(node: EventTarget, type: string, handler: (event: any) => void, useCaptureOrOptions?: boolean | AddEventListenerOptions): IDisposable {
-	return new DomListener(node, type, handler, useCaptureOrOptions);
+	let resolvedOptions = useCaptureOrOptions;
+
+	if (type === 'touchstart' || type === 'touchmove' || type === 'touchend' || type === 'touchcancel') {
+		if (typeof resolvedOptions === 'boolean') {
+			resolvedOptions = { capture: resolvedOptions, passive: true };
+		} else if (typeof resolvedOptions === 'object') {
+			resolvedOptions = resolvedOptions.passive === undefined ? { ...resolvedOptions, passive: true } : resolvedOptions;
+		} else {
+			resolvedOptions = { passive: true };
+		}
+	} else if ((type === EventType.POINTER_DOWN || type === EventType.POINTER_MOVE || type === EventType.POINTER_UP) && typeof resolvedOptions !== 'object') {
+		resolvedOptions = resolvedOptions ?? false;
+	}
+
+	return new DomListener(node, type, handler, resolvedOptions);
 }
 
 export interface IAddStandardDisposableListenerSignature {

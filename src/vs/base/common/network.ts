@@ -185,7 +185,8 @@ class RemoteAuthoritiesImpl {
 	}
 
 	setServerRootPath(product: { quality?: string; commit?: string }, serverBasePath: string | undefined): void {
-		this._serverRootPath = paths.posix.join(serverBasePath ?? '/', getServerProductSegment(product));
+		const joined = paths.posix.join(serverBasePath ?? '/', getServerProductSegment(product));
+		this._serverRootPath = joined.endsWith('/') ? joined : `${joined}/`;
 	}
 
 	getServerRootPath(): string {

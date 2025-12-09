@@ -3,7 +3,6 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { createHotClass } from '../../../../base/common/hotReloadHelpers.js';
 import { Disposable, DisposableStore } from '../../../../base/common/lifecycle.js';
 import { autorunWithStore, debouncedObservable, derived, observableFromEvent } from '../../../../base/common/observable.js';
 import Severity from '../../../../base/common/severity.js';
@@ -15,8 +14,6 @@ import { IEditorService } from '../../../services/editor/common/editorService.js
 import { ILanguageStatusService } from '../../../services/languageStatus/common/languageStatusService.js';
 
 export class InlineCompletionLanguageStatusBarContribution extends Disposable implements IWorkbenchContribution {
-	public static readonly hot = createHotClass(InlineCompletionLanguageStatusBarContribution);
-
 	public static Id = 'vs.contrib.inlineCompletionLanguageStatusBarContribution';
 	public static readonly languageStatusBarDisposables = new Set<DisposableStore>();
 

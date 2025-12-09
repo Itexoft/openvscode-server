@@ -445,6 +445,8 @@ export class MultiEditorTabsControl extends EditorTabsControl {
 				return;
 			}
 
+			const previousScrollLeft = tabsContainer.scrollLeft;
+
 			const nextEditor = this.groupView.getEditorByIndex(this.groupView.getIndexOfEditor(activeEditor) + tabSwitchDirection);
 			if (!nextEditor) {
 				return;
@@ -453,9 +455,17 @@ export class MultiEditorTabsControl extends EditorTabsControl {
 			// Open it
 			this.groupView.openEditor(nextEditor);
 
-			// Disable normal scrolling, opening the editor will already reveal it properly
-			EventHelper.stop(e, true);
-		}));
+			// Reset any scrolling that might have occurred as part of the default wheel behaviour
+				scheduleAtNextAnimationFrame(getWindow(tabsContainer), () => {
+				if (!tabsContainer.isConnected) {
+					return;
+				}
+
+				if (Math.abs(tabsContainer.scrollLeft - previousScrollLeft) > 0.5) {
+					tabsScrollbar.setScrollPosition({ scrollLeft: previousScrollLeft });
+				}
+			});
+		}, { passive: true }));
 
 		// Context menu
 		const showContextMenu = (e: Event) => {

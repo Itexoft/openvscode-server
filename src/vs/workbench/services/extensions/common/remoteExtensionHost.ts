@@ -123,10 +123,13 @@ export class RemoteExtensionHost extends Disposable implements IExtensionHost {
 				startParams.break = false;
 			}
 
+			this._logService.info(`[RemoteExtHost] Initiating connection (${this.remoteAuthority}) with start params`, { language: startParams.language, hasDebug: !!startParams.debugId, envKeys: Object.keys(startParams.env ?? {}) });
+
 			return connectRemoteAgentExtensionHost(options, startParams).then(result => {
 				this._register(result);
 				const { protocol, debugPort, reconnectionToken } = result;
 				const isExtensionDevelopmentDebug = typeof debugPort === 'number';
+				this._logService.info(`[RemoteExtHost] Connection established (token ${reconnectionToken.substr(0, 8)}), waiting for ready/initialized...`);
 				if (debugOk && this._environmentService.isExtensionDevelopment && this._environmentService.debugExtensionHost.debugId && debugPort) {
 					this._extensionHostDebugService.attachSession(this._environmentService.debugExtensionHost.debugId, debugPort, this._initDataProvider.remoteAuthority);
 				}
@@ -153,6 +156,7 @@ export class RemoteExtensionHost extends Disposable implements IExtensionHost {
 
 						if (isMessageOfType(msg, MessageType.Ready)) {
 							// 1) Extension Host is ready to receive messages, initialize it
+							this._logService.info(`[RemoteExtHost] Received Ready from extension host (${reconnectionToken.substr(0, 8)}). Sending init data...`);
 							this._createExtHostInitData(isExtensionDevelopmentDebug).then(data => {
 								protocol.send(VSBuffer.fromString(JSON.stringify(data)));
 							});
@@ -169,11 +173,13 @@ export class RemoteExtensionHost extends Disposable implements IExtensionHost {
 
 							// release this promise
 							this._protocol = protocol;
+							this._logService.info(`[RemoteExtHost] Extension host initialized (${reconnectionToken.substr(0, 8)}).`);
 							resolve(protocol);
 
 							return;
 						}
 
+						this._logService.error(`[RemoteExtHost] Unexpected handshake message from extension host (${reconnectionToken.substr(0, 8)}): ${msg.toString()}`);
 						console.error(`received unexpected message during handshake phase from the extension host: `, msg);
 					});
 
@@ -187,6 +193,7 @@ export class RemoteExtensionHost extends Disposable implements IExtensionHost {
 			// avoid re-entering this method
 			return;
 		}
+		this._logService.warn(`[RemoteExtHost] Connection lost (${reconnectionToken.substr(0, 8)}). Initiating termination.`);
 		this._hasLostConnection = true;
 
 		if (this._isExtensionDevHost && this._environmentService.debugExtensionHost.debugId) {

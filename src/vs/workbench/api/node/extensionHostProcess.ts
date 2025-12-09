@@ -30,24 +30,34 @@ import './extHost.node.services.js';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 
+const warningListeners = process.listeners('warning');
+process.removeAllListeners('warning');
+const ignoredWarningCodes = new Set<string>(['DEP0040']);
+const ignoredWarningNames = new Set<string>(process.env.VSCODE_DEV ? ['ExperimentalWarning'] : []);
+process.on('warning', (warning: any) => {
+	if (ignoredWarningCodes.has(warning?.code) || ignoredWarningNames.has(warning?.name)) {
+		return;
+	}
+
+	if (warningListeners.length) {
+		for (const listener of warningListeners) {
+			try {
+				listener(warning);
+			} catch (error) {
+				console.error(error);
+			}
+		}
+		return;
+	}
+
+	console.warn(warning);
+});
+
 interface ParsedExtHostArgs {
 	transformURIs?: boolean;
 	skipWorkspaceStorageLock?: boolean;
 	supportGlobalNavigator?: boolean; // enable global navigator object in nodejs
 	useHostProxy?: 'true' | 'false'; // use a string, as undefined is also a valid value
-}
-
-// silence experimental warnings when in development
-if (process.env.VSCODE_DEV) {
-	const warningListeners = process.listeners('warning');
-	process.removeAllListeners('warning');
-	process.on('warning', (warning: any) => {
-		if (warning.code === 'ExperimentalWarning' || warning.name === 'ExperimentalWarning') {
-			return;
-		}
-
-		warningListeners[0](warning);
-	});
 }
 
 // workaround for https://github.com/microsoft/vscode/issues/85490
@@ -286,6 +296,7 @@ async function createExtHostProtocol(): Promise<IMessagePassingProtocol> {
 			this._terminating = false;
 			this._protocolListener = protocol.onMessage((msg) => {
 				if (isMessageOfType(msg, MessageType.Terminate)) {
+					console.warn(`ExtensionHostProcess: received terminate message from renderer at ${new Date().toISOString()}`);
 					this._terminating = true;
 					this._protocolListener.dispose();
 					onTerminate('received terminate message from renderer');
@@ -326,6 +337,11 @@ function connectToRenderer(protocol: IMessagePassingProtocol): Promise<IRenderer
 				if (rendererCommit !== myCommit) {
 					nativeExit(ExtensionHostExitCode.VersionMismatch);
 				}
+			}
+
+			if (typeof process.ppid === 'number' && initData.parentPid && initData.parentPid !== process.ppid) {
+				console.warn(`ExtensionHostProcess: received stale parentPid ${initData.parentPid}, normalizing to ${process.ppid}.`);
+				initData.parentPid = process.ppid;
 			}
 
 			if (initData.parentPid) {

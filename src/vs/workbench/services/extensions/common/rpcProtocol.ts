@@ -133,6 +133,7 @@ export class RPCProtocol extends Disposable implements IRPCProtocol {
 	private _lastMessageId: number;
 	private readonly _cancelInvokedHandlers: { [req: string]: () => void };
 	private readonly _pendingRPCReplies: { [msgId: string]: PendingRPCReply };
+	private readonly _pendingRPCRequestInfo: Record<string, { label: string; created: number; stack?: string }>;
 	private _responsiveState: ResponsiveState;
 	private _unacknowledgedCount: number;
 	private _unresponsiveTime: number;
@@ -154,6 +155,7 @@ export class RPCProtocol extends Disposable implements IRPCProtocol {
 		this._lastMessageId = 0;
 		this._cancelInvokedHandlers = Object.create(null);
 		this._pendingRPCReplies = {};
+		this._pendingRPCRequestInfo = Object.create(null);
 		this._responsiveState = ResponsiveState.Responsive;
 		this._unacknowledgedCount = 0;
 		this._unresponsiveTime = 0;
@@ -226,6 +228,21 @@ export class RPCProtocol extends Disposable implements IRPCProtocol {
 			return;
 		}
 		this._responsiveState = newResponsiveState;
+		if (newResponsiveState === ResponsiveState.Unresponsive) {
+			try {
+				const entries = Object.entries(this._pendingRPCRequestInfo);
+				if (entries.length) {
+					const summary = entries.map(([id, info]) => `${id}:${info.label ?? 'unknown'}`).join(', ');
+					console.warn(`[RPCProtocol] Extension host became unresponsive with ${entries.length} pending requests: ${summary}`);
+				} else {
+					console.warn(`[RPCProtocol] Extension host became unresponsive but no pending request metadata was recorded.`);
+				}
+			} catch (error) {
+				console.warn(`[RPCProtocol] Failed to report pending requests during unresponsive transition: ${error instanceof Error ? error.message : error}`);
+			}
+		} else {
+			console.warn(`[RPCProtocol] Extension host reported responsive.`);
+		}
 		this._onDidChangeResponsiveState.fire(this._responsiveState);
 	}
 
@@ -360,6 +377,11 @@ export class RPCProtocol extends Disposable implements IRPCProtocol {
 	private _receiveRequest(msgLength: number, req: number, rpcId: number, method: string, args: any[], usesCancellationToken: boolean): void {
 		this._logger?.logIncoming(msgLength, req, RequestInitiator.OtherSide, `receiveRequest ${getStringIdentifierForProxy(rpcId)}.${method}(`, args);
 		const callId = String(req);
+		try {
+			console.log(`[RPCProtocol] ⇐ request #${callId} ${getStringIdentifierForProxy(rpcId)}.${method}`);
+		} catch (error) {
+			// ignore logging failures
+		}
 
 		let promise: Promise<any>;
 		let cancel: () => void;
@@ -386,11 +408,21 @@ export class RPCProtocol extends Disposable implements IRPCProtocol {
 			const msg = MessageIO.serializeReplyOK(req, r, this._uriReplacer);
 			this._logger?.logOutgoing(msg.byteLength, req, RequestInitiator.OtherSide, `reply:`, r);
 			this._protocol.send(msg);
+			try {
+				console.log(`[RPCProtocol] ⇒ reply #${callId} ${getStringIdentifierForProxy(rpcId)}.${method} ok`);
+			} catch (error) {
+				// ignore logging failures
+			}
 		}, (err) => {
 			delete this._cancelInvokedHandlers[callId];
 			const msg = MessageIO.serializeReplyErr(req, err);
 			this._logger?.logOutgoing(msg.byteLength, req, RequestInitiator.OtherSide, `replyErr:`, err);
 			this._protocol.send(msg);
+			try {
+				console.warn(`[RPCProtocol] ⇒ reply #${callId} ${getStringIdentifierForProxy(rpcId)}.${method} error: ${err instanceof Error ? err.message : err}`);
+			} catch (error) {
+				// ignore logging failures
+			}
 		});
 	}
 
@@ -409,6 +441,7 @@ export class RPCProtocol extends Disposable implements IRPCProtocol {
 
 		const pendingReply = this._pendingRPCReplies[callId];
 		delete this._pendingRPCReplies[callId];
+		delete this._pendingRPCRequestInfo[callId];
 
 		pendingReply.resolveOk(value);
 	}
@@ -423,6 +456,7 @@ export class RPCProtocol extends Disposable implements IRPCProtocol {
 
 		const pendingReply = this._pendingRPCReplies[callId];
 		delete this._pendingRPCReplies[callId];
+		delete this._pendingRPCRequestInfo[callId];
 
 		let err: any = undefined;
 		if (value) {
@@ -488,6 +522,12 @@ export class RPCProtocol extends Disposable implements IRPCProtocol {
 		}
 
 		this._pendingRPCReplies[callId] = new PendingRPCReply(result, disposable);
+		const label = `${getStringIdentifierForProxy(rpcId)}.${methodName}`;
+		this._pendingRPCRequestInfo[callId] = {
+			label,
+			created: Date.now(),
+			stack: Error().stack
+		};
 		this._onWillSendRequest(req);
 		const msg = MessageIO.serializeRequest(req, rpcId, methodName, serializedRequestArguments, !!cancellationToken);
 		this._logger?.logOutgoing(msg.byteLength, req, RequestInitiator.LocalSide, `request: ${getStringIdentifierForProxy(rpcId)}.${methodName}(`, args);

@@ -5,7 +5,7 @@
 	<meta charset="UTF-8">
 
 	<meta http-equiv="Content-Security-Policy"
-		content="default-src 'none'; script-src 'sha256-ZcIhtIuU4M9PbKfs7w/CLqHimFJRK8L7mYTXOfiUv0I=' 'self'; frame-src 'self'; style-src 'unsafe-inline';">
+		content="default-src 'none'; script-src 'self' 'unsafe-inline'; connect-src 'self' https: http:; worker-src 'self'; frame-src 'self'; style-src 'unsafe-inline';">
 
 	<!-- Disable pinch zooming -->
 	<meta name="viewport"
@@ -29,12 +29,282 @@
 			navigator.userAgent.indexOf('Firefox') >= 0
 		);
 
+		/**
+		 * @param {string | null} base64
+		 */
+		const decodeEmbeddedServiceWorkerSource = (base64) => {
+		if (typeof base64 !== 'string') {
+			return undefined;
+		}
+		try {
+			const binary = atob(base64);
+			if (typeof TextDecoder === 'function') {
+				const bytes = new Uint8Array(binary.length);
+				for (let i = 0; i < binary.length; i++) {
+					bytes[i] = binary.charCodeAt(i);
+				}
+				return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+			}
+			// Fallback for environments without TextDecoder
+			return decodeURIComponent(Array.prototype.map.call(binary, (ch) => '%' + ('00' + ch.charCodeAt(0).toString(16)).slice(-2)).join(''));
+		} catch (error) {
+			console.error('Failed to decode embedded service worker source', error);
+			return undefined;
+		}
+		};
+
 		const searchParams = new URL(location.toString()).searchParams;
+		const CONNECTION_TOKEN_COOKIE_NAME = 'vscode-tkn';
+		const readCookie = (name) => {
+			try {
+				const raw = document.cookie;
+				if (!raw) {
+					return undefined;
+				}
+				for (const part of raw.split(';')) {
+					const trimmed = part.trim();
+					if (trimmed.startsWith(`${name}=`)) {
+						return trimmed.slice(name.length + 1);
+					}
+				}
+			} catch {
+				return undefined;
+			}
+			return undefined;
+		};
+		let connectionToken = (() => {
+			const fromQuery = searchParams.get('tkn');
+			if (fromQuery) {
+				return fromQuery;
+			}
+			const fromCookie = readCookie(CONNECTION_TOKEN_COOKIE_NAME);
+			return fromCookie || undefined;
+		})();
+		if (!connectionToken && globalThis.__openvscodeConnectionToken) {
+			connectionToken = globalThis.__openvscodeConnectionToken;
+		}
+	let parentDebug = false;
+	try {
+		parentDebug = !!(globalThis.parent && globalThis.parent !== globalThis && globalThis.parent.__openvscodeWebviewDebug === true);
+	} catch (error) {
+		parentDebug = false;
+	}
+	const debugEnabled = searchParams.get('debug') === '1' || searchParams.has('debug') || globalThis.__openvscodeWebviewDebug === true || parentDebug;
+		const debugLog = (...args) => {
+			if (debugEnabled) {
+				console.log('[webview]', ...args);
+			}
+		};
+		const debugWarn = (...args) => {
+			if (debugEnabled) {
+				console.warn('[webview]', ...args);
+			}
+		};
+		const debugInfo = (...args) => {
+			if (debugEnabled) {
+				console.info('[webview]', ...args);
+			}
+		};
 		const ID = searchParams.get('id');
 		const webviewOrigin = searchParams.get('origin');
+		const parentOrigin = searchParams.get('parentOrigin');
 		const onElectron = searchParams.get('platform') === 'electron';
 		const disableServiceWorker = searchParams.has('disableServiceWorker');
-		const expectedWorkerVersion = parseInt(searchParams.get('swVersion'));
+		const embeddedServiceWorkerSourceBase64 = /*__SERVICE_WORKER_SOURCE__*/ null;
+		const embeddedServiceWorkerVersion = /*__SERVICE_WORKER_VERSION__*/ undefined;
+		let expectedWorkerVersion = searchParams.get('swVersion') ?? '0';
+		let cachedServiceWorkerSourceText = decodeEmbeddedServiceWorkerSource(embeddedServiceWorkerSourceBase64);
+		let cachedServiceWorkerBlobUrl;
+		const resourceBaseAuthority = searchParams.get('vscode-resource-base-authority') ?? '';
+		const resourceBaseScheme = (searchParams.get('vscode-resource-base-scheme') ?? '').toLowerCase() || 'https';
+		/** @type {string | undefined} */
+		let rememberedResourceBase;
+
+		const encodeAuthoritySegment = (value) => {
+			if (typeof value !== 'string') {
+				return '';
+			}
+			let result = '';
+			for (const ch of value) {
+				if (/^[A-Za-z0-9]$/.test(ch)) {
+					result += ch;
+				} else {
+					result += `-${ch.charCodeAt(0).toString(16).padStart(4, '0')}`;
+				}
+			}
+			return result;
+		};
+
+		const decodeAuthoritySegment = (value) => {
+			if (typeof value !== 'string') {
+				return '';
+			}
+			return value.replace(/-([0-9a-fA-F]{4})/g, (_, hex) => {
+				const parsed = parseInt(hex, 16);
+				return Number.isFinite(parsed) ? String.fromCharCode(parsed) : `-${hex}`;
+			});
+		};
+
+		const parseLegacyRemoteResourceUrl = (raw) => {
+			try {
+				const decoded = decodeUriMulti(raw);
+				const parsed = new URL(decoded);
+				const markerIndex = parsed.hostname.toLowerCase().indexOf('.vscode-resource.');
+				if (markerIndex === -1) {
+					return undefined;
+				}
+				const prefix = parsed.hostname.slice(0, markerIndex);
+				if (!prefix.startsWith('vscode-remote+')) {
+					return undefined;
+				}
+				const encodedAuthority = prefix.slice('vscode-remote+'.length);
+				const decodedAuthority = decodeAuthoritySegment(encodedAuthority);
+				const reEncodedAuthority = encodeAuthoritySegment(decodedAuthority);
+				const suffix = resourceBaseAuthority ? `.${resourceBaseAuthority}` : parsed.hostname.slice(markerIndex);
+				const syntheticHost = `vscode-remote+${reEncodedAuthority}${suffix}`;
+				const pathWithQuery = `${parsed.pathname ?? ''}${parsed.search ?? ''}${parsed.hash ?? ''}`;
+				return `${resourceBaseScheme ?? 'https'}://${syntheticHost}${pathWithQuery || '/'}`;
+			} catch {
+				return undefined;
+			}
+		};
+
+		const rememberResourceBase = (value) => {
+			if (typeof value !== 'string' || !value.length) {
+				return;
+			}
+			const normalizeBase = (raw) => {
+				try {
+					const normalized = ensureResourceScheme(raw);
+					const parsed = new URL(normalized);
+					if (!parsed.pathname.endsWith('/')) {
+						const segments = parsed.pathname.split('/');
+						if (segments.length > 1) {
+							segments.pop();
+						}
+						const candidatePath = segments.join('/') || '/';
+						parsed.pathname = candidatePath.endsWith('/') ? candidatePath : `${candidatePath}/`;
+					}
+					parsed.search = '';
+					parsed.hash = '';
+					return parsed.toString();
+				} catch (error) {
+					if (debugEnabled) {
+						debugWarn('[WebviewPre] failed to normalize resource base', { value: raw, error });
+					}
+					return raw;
+				}
+			};
+
+			const nextBase = normalizeBase(value);
+			if (rememberedResourceBase) {
+				try {
+					const current = new URL(rememberedResourceBase);
+					const next = new URL(nextBase);
+					const sameOrigin = current.origin === next.origin;
+					const currentPath = current.pathname.endsWith('/') ? current.pathname : `${current.pathname}/`;
+					const nextPath = next.pathname.endsWith('/') ? next.pathname : `${next.pathname}/`;
+					if (sameOrigin && nextPath.startsWith(currentPath) && nextPath.length > currentPath.length) {
+						return;
+					}
+				} catch {
+					// ignore comparison failures and update the base below
+				}
+			}
+
+			rememberedResourceBase = nextBase;
+			globalThis.__lastResourceBase = nextBase;
+			if (debugEnabled) {
+				debugLog('[WebviewPre] rememberResourceBase set', { value, rememberedResourceBase });
+			}
+		};
+
+		const resolveRelativeResource = (rawValue) => {
+			if (typeof rawValue !== 'string' || !rawValue.length) {
+				return undefined;
+			}
+			if (!rememberedResourceBase) {
+				return undefined;
+			}
+			const trimmed = rawValue.trim();
+			if (!trimmed.length) {
+				return undefined;
+			}
+			if (/^(?:data|javascript|about):/i.test(trimmed)) {
+				return undefined;
+			}
+			if (trimmed.startsWith('#')) {
+				return undefined;
+			}
+			if (/^[a-zA-Z][a-zA-Z0-9+\-.]*:/.test(trimmed)) {
+				return undefined;
+			}
+			try {
+				const normalized = trimmed.startsWith('/') ? `.${trimmed}` : trimmed;
+				const resolved = new URL(normalized, rememberedResourceBase);
+				const sanitized = ensureResourceScheme(resolved.toString());
+				rememberResourceBase(sanitized);
+				const encoded = encodeURIComponent(sanitized);
+				return new URL(`./resource/${encoded}`, location.href).toString();
+			} catch (error) {
+				if (debugEnabled) {
+					debugWarn('[WebviewPre] failed to resolve relative resource', {
+						value: rawValue,
+						base: rememberedResourceBase,
+						error
+					});
+				}
+				return undefined;
+			}
+		};
+		const SERVICE_WORKER_RESOURCE_CACHE_PREFIX = 'vscode-resource-cache-';
+		const extractCommitFromUrl = (value) => {
+			if (typeof value !== 'string') {
+				return undefined;
+			}
+			const match = value.match(/\/oss-([0-9a-fA-F]{32,})\//);
+			return match ? match[1] : undefined;
+		};
+		const currentCommit = (() => {
+			const fromPath = extractCommitFromUrl(location.pathname);
+			if (fromPath) {
+				return fromPath.toLowerCase();
+			}
+			const fromHost = extractCommitFromUrl(location.href);
+			return fromHost ? fromHost.toLowerCase() : undefined;
+		})();
+
+		if (!disableServiceWorker && typeof embeddedServiceWorkerVersion === 'string' && embeddedServiceWorkerVersion.length) {
+			expectedWorkerVersion = embeddedServiceWorkerVersion;
+		}
+
+		if (!cachedServiceWorkerSourceText) {
+			try {
+				const swUrl = new URL('service-worker.js', location.toString());
+				const swResponse = await fetch(swUrl.toString(), { cache: 'no-cache' });
+				if (!swResponse.ok) {
+					throw new Error(`Failed to fetch service worker script: ${swResponse.status}`);
+				}
+				const swSource = await swResponse.arrayBuffer();
+				try {
+					cachedServiceWorkerSourceText = new TextDecoder('utf-8', { fatal: false }).decode(swSource);
+				} catch (error) {
+					debugWarn('Failed to decode service worker source', error);
+					cachedServiceWorkerSourceText = undefined;
+				}
+				const hashBuffer = await crypto.subtle.digest('SHA-256', swSource);
+				const hashArray = Array.from(new Uint8Array(hashBuffer));
+				expectedWorkerVersion = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+			} catch (error) {
+				console.error('Could not compute service worker version', error);
+				if (expectedWorkerVersion === 'auto' || expectedWorkerVersion === '0') {
+					expectedWorkerVersion = Date.now().toString();
+				}
+			}
+		}
+
+		globalThis.__webviewComputedServiceWorkerVersion = expectedWorkerVersion;
+
 
 		/**
 		 * @param {string} name
@@ -53,6 +323,8 @@
 
 		/** @type {MessageChannel | undefined} */
 		let outerIframeMessageChannel;
+		/** @type {string | undefined} */
+		let lastRegisteredServiceWorkerScope;
 
 		/**
 		 * Use polling to track focus of main webview and iframes within the webview
@@ -201,12 +473,332 @@
 			}
 		}`;
 
-		/**
-		 * @param {boolean} allowMultipleAPIAcquire
-		 * @param {*} [state]
-		 * @return {string}
-		 */
-		function getVsCodeApiScript(allowMultipleAPIAcquire, state) {
+	const decodeUriMulti = (value) => {
+		let result = value;
+		for (let i = 0; i < 3; i++) {
+			try {
+				const decoded = decodeURIComponent(result);
+				if (decoded === result) {
+					break;
+				}
+				result = decoded;
+			} catch {
+				break;
+			}
+		}
+		return result;
+	};
+
+	const ensureResourceScheme = (value) => {
+		if (!value) {
+			return value;
+		}
+		if (resourceBaseScheme) {
+			if (/^[a-zA-Z0-9+\-.]+:\/\//.test(value)) {
+				return value.replace(/^[a-zA-Z0-9+\-.]+:\/\//, `${resourceBaseScheme}://`);
+			}
+			return `${resourceBaseScheme}://${value}`;
+		}
+		return value;
+	};
+
+	const decodeSanitizedExtensionResource = (value) => {
+		try {
+			const resolved = new URL(value, location.href);
+			const marker = '/resource/';
+			const markerIndex = resolved.pathname.indexOf(marker);
+			if (markerIndex === -1) {
+				return undefined;
+			}
+			const encodedTarget = resolved.pathname.slice(markerIndex + marker.length);
+			if (!encodedTarget.length) {
+				return undefined;
+			}
+			const decodedTarget = ensureResourceScheme(decodeUriMulti(encodedTarget));
+			if (/^[a-zA-Z0-9+\-.]+:\/\/vscode-remote\+/i.test(decodedTarget)) {
+				return decodedTarget;
+			}
+		} catch {
+			// ignore malformed resource urls
+		}
+		return undefined;
+	};
+
+	const rewriteExtensionResourceUrl = (rawValue) => {
+		if (typeof rawValue !== 'string') {
+			return undefined;
+		}
+
+		let cleanedRaw = rawValue.trim();
+		cleanedRaw = cleanedRaw.replace(/^[\"']|[\"']$/g, '');
+		cleanedRaw = cleanedRaw.replace(/>+$/, '');
+
+		let targetResource = decodeSanitizedExtensionResource(rawValue);
+		if (targetResource) {
+			rememberResourceBase(targetResource);
+		}
+
+		if (!targetResource) {
+			const needsRewrite = cleanedRaw.includes('vscode-remote%2B')
+				|| cleanedRaw.includes('vscode-remote%252B')
+				|| /vscode-resource\./i.test(cleanedRaw)
+				|| /^vscode-remote:\/\//i.test(cleanedRaw)
+				|| /^https?:\/\/vscode-remote\+/i.test(cleanedRaw);
+			if (!needsRewrite) {
+				return resolveRelativeResource(cleanedRaw);
+			}
+
+			try {
+				const decodedRaw = decodeUriMulti(cleanedRaw);
+				const legacyTarget = parseLegacyRemoteResourceUrl(decodedRaw);
+				if (legacyTarget) {
+					targetResource = legacyTarget;
+				}
+				const remoteHostMatch = !targetResource ? decodedRaw.match(/^https?:\/\/vscode-remote\+([^/]+)\.vscode-resource\.[^/]+(\/.*)$/i) : null;
+				if (remoteHostMatch) {
+					const decodedAuthority = decodeAuthoritySegment(remoteHostMatch[1]);
+					const encodedAuthority = encodeAuthoritySegment(decodedAuthority);
+					const suffix = resourceBaseAuthority ? `.${resourceBaseAuthority}` : '';
+					const syntheticHost = `vscode-remote+${encodedAuthority}${suffix}`;
+					const pathWithQuery = remoteHostMatch[2] || '/';
+					targetResource = `${resourceBaseScheme ?? 'https'}://${syntheticHost}${pathWithQuery}`;
+				} else if (!targetResource && /^vscode-remote:\/\//i.test(decodedRaw)) {
+					const remoteUrl = new URL(decodedRaw);
+					const encodedAuthority = encodeAuthoritySegment(remoteUrl.host);
+					const suffix = resourceBaseAuthority ? `.${resourceBaseAuthority}` : '';
+					const syntheticHost = `vscode-remote+${encodedAuthority}${suffix}`;
+					const pathWithQuery = `${remoteUrl.pathname ?? ''}${remoteUrl.search ?? ''}${remoteUrl.hash ?? ''}`;
+					const reconstructed = new URL(pathWithQuery || '/', `${resourceBaseScheme}://${syntheticHost}`);
+					targetResource = reconstructed.toString();
+				} else if (!targetResource) {
+					targetResource = ensureResourceScheme(decodedRaw);
+					try {
+						const candidateUrl = new URL(targetResource);
+						if (resourceBaseAuthority) {
+							const hostPattern = /vscode-resource\.[^/:]+/i;
+							const updatedHost = candidateUrl.host.replace(hostPattern, resourceBaseAuthority);
+							candidateUrl.host = updatedHost;
+						}
+						if (resourceBaseScheme) {
+							candidateUrl.protocol = `${resourceBaseScheme}:`;
+						}
+						candidateUrl.port = '';
+						targetResource = candidateUrl.toString();
+					} catch {
+						if (resourceBaseAuthority) {
+							targetResource = targetResource.replace(/vscode-resource\.[^/]+/i, resourceBaseAuthority);
+						}
+						targetResource = targetResource.replace(/(vscode-resource\.[^/:]+):\d+/i, '$1');
+					}
+				}
+			} catch (error) {
+				if (debugEnabled) {
+					debugWarn('[Webview] Failed to normalize resource url', { value: rawValue, error });
+				}
+				return undefined;
+			}
+		}
+
+		if (!targetResource) {
+			return undefined;
+		}
+
+		rememberResourceBase(targetResource);
+		const encodedUri = encodeURIComponent(targetResource);
+		return new URL(`./resource/${encodedUri}`, location.href).toString();
+	};
+
+	const getOriginalResourceAttributeValue = (element, attr, currentValue) => {
+		const dataAttrName = `data-vscode-original-${attr}`;
+		if (!element.hasAttribute(dataAttrName) && typeof currentValue === 'string') {
+			element.setAttribute(dataAttrName, currentValue);
+			return currentValue;
+		}
+		const stored = element.getAttribute(dataAttrName);
+		if (stored !== null) {
+			return stored;
+		}
+		if (typeof currentValue === 'string') {
+			element.setAttribute(dataAttrName, currentValue);
+			return currentValue;
+		}
+		return currentValue;
+	};
+
+	const resourceAttributeCandidates = [
+		{ selector: 'script', attrs: ['src'] },
+		{ selector: 'link', attrs: ['href'] },
+		{ selector: 'img', attrs: ['src'] },
+		{ selector: 'audio', attrs: ['src'] },
+		{ selector: 'video', attrs: ['src', 'poster'] },
+		{ selector: 'source', attrs: ['src'] },
+		{ selector: 'iframe', attrs: ['src'] },
+		{ selector: 'track', attrs: ['src'] },
+		{ selector: 'object', attrs: ['data'] }
+	];
+
+	const resourceAttributeMap = (() => {
+		const map = new Map();
+		for (const { selector, attrs } of resourceAttributeCandidates) {
+			map.set(selector.toLowerCase(), attrs);
+		}
+		return map;
+	})();
+
+	const resourceAttributeNames = Array.from(
+		new Set(resourceAttributeCandidates.flatMap((c) => c.attrs)),
+	).map((name) => name.toLowerCase());
+
+	const sanitizeResourceElement = (element) => {
+		const attrs = resourceAttributeMap.get(element.tagName.toLowerCase());
+		if (!attrs) {
+			return;
+		}
+		for (const attr of attrs) {
+			const currentValue = element.getAttribute(attr);
+			if (!currentValue) {
+				continue;
+			}
+			const originalValue = getOriginalResourceAttributeValue(
+				element,
+				attr,
+				currentValue,
+			);
+			const rewriteTarget = originalValue ?? currentValue;
+			const rewritten = rewriteExtensionResourceUrl(rewriteTarget);
+			if (rewritten && rewritten !== currentValue) {
+				element.setAttribute(attr, rewritten);
+			}
+		}
+	};
+
+	const sanitizeResourceAttributes = (doc) => {
+		for (const { selector, attrs } of resourceAttributeCandidates) {
+			for (const element of Array.from(doc.querySelectorAll(selector))) {
+				for (const attr of attrs) {
+					const currentValue = element.getAttribute(attr);
+					if (!currentValue) {
+						continue;
+					}
+					const originalValue = getOriginalResourceAttributeValue(element, attr, currentValue);
+					const rewriteTarget = originalValue ?? currentValue;
+					const rewritten = rewriteExtensionResourceUrl(rewriteTarget);
+					if (rewritten && rewritten !== currentValue) {
+						element.setAttribute(attr, rewritten);
+					}
+				}
+			}
+		}
+	};
+
+	const registerResourceMutationObserver = (doc) => {
+		try {
+			const observer = new MutationObserver((mutations) => {
+				for (const mutation of mutations) {
+					if (
+						mutation.type === 'attributes' &&
+						mutation.attributeName &&
+						resourceAttributeNames.includes(mutation.attributeName.toLowerCase()) &&
+						mutation.target instanceof Element
+					) {
+						sanitizeResourceElement(mutation.target);
+					} else if (mutation.type === 'childList') {
+						for (const node of mutation.addedNodes) {
+							if (node instanceof Element) {
+								const queue = [node];
+								while (queue.length) {
+									const current = queue.shift();
+									if (current) {
+										sanitizeResourceElement(current);
+										for (const child of Array.from(current.children)) {
+											queue.push(child);
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			});
+
+			observer.observe(doc, {
+				subtree: true,
+				childList: true,
+				attributes: true,
+				attributeFilter: resourceAttributeNames,
+			});
+		} catch (error) {
+			debugWarn('[WebviewPre] failed to register mutation observer', error);
+		}
+	};
+
+	const collectSanitizedResourceUrls = (doc) => {
+		const urls = new Set();
+		for (const { selector, attrs } of resourceAttributeCandidates) {
+			for (const element of Array.from(doc.querySelectorAll(selector))) {
+				for (const attr of attrs) {
+					const raw = element.getAttribute(attr);
+					if (!raw || typeof raw !== 'string') {
+						continue;
+					}
+					if (/^(?:data|javascript|about):/i.test(raw) || raw.startsWith('#')) {
+						continue;
+					}
+					try {
+						const absolute = new URL(raw, location.href).toString();
+						urls.add(absolute);
+					} catch {
+						// ignore malformed urls
+					}
+				}
+			}
+		}
+		return urls;
+	};
+
+	const warmUpResources = async (doc) => {
+		if (disableServiceWorker || !serviceWorkerRoutingEnabled) {
+			return;
+		}
+		const urls = collectSanitizedResourceUrls(doc);
+		if (!urls.size) {
+			return;
+		}
+		const prefetchLimit = 24;
+		const tasks = [];
+		let count = 0;
+		for (const url of urls) {
+			if (++count > prefetchLimit) {
+				break;
+			}
+			tasks.push((async () => {
+				try {
+					const response = await fetch(url, {
+						method: 'GET',
+						credentials: 'include',
+						cache: 'no-cache'
+					});
+					if (!response.ok && debugEnabled) {
+						debugWarn('[WebviewPre] resource warmup failed', { url, status: response.status });
+					}
+				} catch (error) {
+					if (debugEnabled) {
+						debugWarn('[WebviewPre] resource warmup error', { url, error });
+					}
+				}
+			})());
+		}
+		if (tasks.length) {
+			await Promise.allSettled(tasks);
+		}
+	};
+
+	/**
+	 * @param {boolean} allowMultipleAPIAcquire
+	 * @param {*} [state]
+	 * @return {string}
+	 */
+	function getVsCodeApiScript(allowMultipleAPIAcquire, state) {
 			const encodedState = state ? encodeURIComponent(state) : undefined;
 			return /* js */`
 					globalThis.acquireVsCodeApi = (function() {
@@ -245,19 +837,376 @@
 				`;
 		}
 
+		const forcedReloadStorageKey = '__vscode_webview_sw_force_reload__';
+		const maxReloadAttempts = 2;
+		let reloadAttempts = 0;
+		const readReloadAttempts = () => {
+			try {
+				const raw = sessionStorage.getItem(forcedReloadStorageKey);
+				const parsed = raw ? Number.parseInt(raw, 10) : 0;
+				return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+			} catch {
+				return 0;
+			}
+		};
+		const writeReloadAttempts = (value) => {
+			try {
+				sessionStorage.setItem(forcedReloadStorageKey, String(value));
+			} catch {
+				// ignore storage failures (private mode, etc.)
+			}
+		};
+	const clearReloadFlag = () => {
+		try {
+			sessionStorage.removeItem(forcedReloadStorageKey);
+		} catch {
+			// ignore storage failures
+		}
+		reloadAttempts = 0;
+	};
+
+	let cleanupInFlight = undefined;
+	const cleanupServiceWorkerArtifacts = async () => {
+		if (cleanupInFlight) {
+			return cleanupInFlight;
+		}
+		cleanupInFlight = (async () => {
+			if (navigator.serviceWorker) {
+				try {
+					if (typeof navigator.serviceWorker.getRegistrations === 'function') {
+						const registrations = await navigator.serviceWorker.getRegistrations();
+						await Promise.all(registrations.map(reg => reg.unregister().catch(error => {
+							debugWarn('[Webview] Failed to unregister service worker during cleanup', error);
+							return false;
+						}))); 
+					} else if (typeof navigator.serviceWorker.getRegistration === 'function' && lastRegisteredServiceWorkerScope) {
+						const registration = await navigator.serviceWorker.getRegistration(lastRegisteredServiceWorkerScope);
+						if (registration) {
+							await registration.unregister().catch(error => {
+								debugWarn('[Webview] Failed to unregister service worker during cleanup', error);
+							});
+						}
+					}
+				} catch (error) {
+					debugWarn('[Webview] Failed to enumerate service worker registrations during cleanup', error);
+				}
+			}
+
+			if (globalThis.caches && typeof globalThis.caches.keys === 'function') {
+				try {
+					const keys = await globalThis.caches.keys();
+					await Promise.all(keys
+						.filter(key => typeof key === 'string' && key.startsWith(SERVICE_WORKER_RESOURCE_CACHE_PREFIX))
+						.map(key => globalThis.caches.delete(key).catch(error => {
+							debugWarn('[Webview] Failed to delete webview cache during cleanup', { key, error });
+							return false;
+						}))
+					);
+				} catch (error) {
+					debugWarn('[Webview] Failed to enumerate caches during cleanup', error);
+				}
+			}
+		})().finally(() => {
+			cleanupInFlight = undefined;
+		});
+		return cleanupInFlight;
+	};
+
+	const triggerCleanup = () => {
+		cleanupServiceWorkerArtifacts().catch(error => {
+			debugWarn('[Webview] Cleanup task failed', error);
+		});
+	};
+		const storageAccessReady = (() => {
+			if (typeof document.hasStorageAccess !== 'function' || typeof document.requestStorageAccess !== 'function') {
+				debugWarn('[Webview] Storage Access API not available');
+				return Promise.resolve({ status: 'unsupported' });
+			}
+			return (async () => {
+				try {
+					const hasAccess = await document.hasStorageAccess();
+					if (hasAccess) {
+						debugWarn('[Webview] Storage access already granted');
+						return { status: 'granted-existing' };
+					}
+				} catch (err) {
+					debugWarn('[Webview] document.hasStorageAccess failed', err);
+				}
+				return await new Promise((resolve) => {
+					const cleanup = () => {
+						window.removeEventListener('pointerdown', requestAccess, true);
+						window.removeEventListener('keydown', requestAccess, true);
+					};
+					const requestAccess = async () => {
+						cleanup();
+						try {
+							await document.requestStorageAccess();
+							debugWarn('[Webview] Storage access granted via user activation');
+							resolve({ status: 'granted-request' });
+						} catch (err) {
+							debugWarn('[Webview] Storage access request rejected', err);
+							resolve({ status: 'rejected', error: String(err) });
+						}
+					};
+					window.addEventListener('pointerdown', requestAccess, true);
+					window.addEventListener('keydown', requestAccess, true);
+					debugWarn('[Webview] Waiting for user activation to request storage access');
+				});
+			})();
+		})();
+
+		let serviceWorkerRoutingEnabled = true;
+		/** @type {(() => void) | undefined} */
+		let resolveWorkerReady;
+
+		reloadAttempts = readReloadAttempts();
+	const markReloadPending = async () => {
+		if (reloadAttempts >= maxReloadAttempts) {
+			debugWarn(`[Webview] Service worker controller unavailable after ${reloadAttempts} reload attempt(s); continuing without additional reload.`);
+			clearReloadFlag();
+			disableServiceWorkerRouting();
+			return;
+		}
+		reloadAttempts += 1;
+		writeReloadAttempts(reloadAttempts);
+		debugWarn(`[Webview] Forcing reload to obtain service worker controller (attempt ${reloadAttempts}/${maxReloadAttempts})`);
+		try {
+			await cleanupServiceWorkerArtifacts();
+		} catch (error) {
+			debugWarn('[Webview] Cleanup before reload failed', error);
+		}
+		location.reload();
+	};
+		/** @type {number | ReturnType<typeof setTimeout> | undefined} */
+		let controllerCheckTimer;
+
 		/** @type {Promise<void>} */
 		const workerReady = new Promise((resolve, reject) => {
+			resolveWorkerReady = resolve;
 			if (disableServiceWorker) {
+				globalThis.__webviewServiceWorkerDisabled = true;
+				serviceWorkerRoutingEnabled = false;
+				try {
+					sanitizeResourceAttributes(document);
+				} catch (error) {
+					debugWarn('[Webview] Failed to sanitize resources with service worker disabled', error);
+				}
 				return resolve();
 			}
 
 			if (!areServiceWorkersEnabled()) {
-				return reject(new Error('Service Workers are not enabled. Webviews will not work. Try disabling private/incognito mode.'));
+				debugWarn('[Webview] Service workers are not available in this environment; continuing without them.', { protocol: location.protocol, hostname: location.hostname });
+				return resolve();
 			}
 
-			const swPath = encodeURI(`service-worker.js?v=${expectedWorkerVersion}&vscode-resource-base-authority=${searchParams.get('vscode-resource-base-authority')}&remoteAuthority=${searchParams.get('remoteAuthority') ?? ''}`);
-			navigator.serviceWorker.register(swPath, { type: 'module' })
+			const navigatorServiceWorker = navigator.serviceWorker;
+			if (!navigatorServiceWorker) {
+				debugWarn('[Webview] navigator.serviceWorker is undefined; continuing without service worker support.', { protocol: location.protocol, hostname: location.hostname });
+				return resolve();
+			}
+
+			const extensionId = searchParams.get('extensionId') ?? '';
+			const swQuery = new URLSearchParams({
+				v: expectedWorkerVersion,
+				'vscode-resource-base-authority': searchParams.get('vscode-resource-base-authority') ?? '',
+				'vscode-resource-base-scheme': searchParams.get('vscode-resource-base-scheme') ?? '',
+				remoteAuthority: searchParams.get('remoteAuthority') ?? ''
+			});
+			if (extensionId) {
+				swQuery.set('extensionId', extensionId);
+			}
+			if (connectionToken) {
+				swQuery.set('tkn', connectionToken);
+			}
+			if (debugEnabled || searchParams.has('openvscodeDebug')) {
+				const debugParam = searchParams.get('openvscodeDebug');
+				if (debugParam === null || debugParam === '') {
+					swQuery.set('openvscodeDebug', '1');
+				} else {
+					swQuery.set('openvscodeDebug', debugParam);
+				}
+			}
+			const swRelativePath = `service-worker.js?${swQuery.toString()}`;
+			const swUrl = new URL(swRelativePath, location.toString());
+			const swUrlString = swUrl.toString();
+			const swUrlSuffix = `${swUrl.pathname}${swUrl.search}`;
+			const effectiveScope = swUrl.origin + swUrl.pathname.replace(/service-worker\.js.*$/, '');
+			const swScope = new URL(swRelativePath, location.toString());
+			const scopePath = swScope.pathname.replace(/service-worker\.js.*$/, '');
+			swScope.pathname = scopePath.endsWith('/') ? scopePath : `${scopePath}/`;
+			swScope.search = '';
+			swScope.hash = '';
+			const swScopeString = swScope.toString();
+			lastRegisteredServiceWorkerScope = swScopeString;
+			debugWarn('[Webview] registerServiceWorker start');
+
+			let controllerEstablished = false;
+			let controllerRecoveryInProgress = false;
+			/** @type {ReturnType<typeof setTimeout> | undefined} */
+			let controllerRecoveryTimer;
+			let persistentControllerMonitorAttached = false;
+			let serviceWorkerRegistrationDepth = 0;
+
+			const scheduleControllerRecovery = () => {
+				if (!controllerEstablished) {
+					return;
+				}
+				if (controllerRecoveryInProgress) {
+					return;
+				}
+				if (serviceWorkerRegistrationDepth > 0) {
+					return;
+				}
+				if (controllerRecoveryTimer) {
+					return;
+				}
+				controllerRecoveryTimer = setTimeout(async () => {
+					controllerRecoveryTimer = undefined;
+					if (navigatorServiceWorker.controller) {
+						return;
+					}
+					if (controllerRecoveryInProgress || serviceWorkerRegistrationDepth > 0) {
+						return;
+					}
+					controllerRecoveryInProgress = true;
+					debugWarn('[Webview] Service worker controller lost; attempting forced re-registration');
+					try {
+						const existing = await navigatorServiceWorker.getRegistration(swScopeString).catch(() => undefined);
+						if (!existing) {
+							debugWarn('[Webview] No service worker registration found during recovery; registering anew');
+						}
+						await registerServiceWorker();
+					} catch (error) {
+						debugWarn('[Webview] Failed to recover service worker controller', error);
+						if (!navigatorServiceWorker.controller && reloadAttempts < maxReloadAttempts) {
+							markReloadPending();
+						}
+					} finally {
+						controllerRecoveryInProgress = false;
+					}
+				}, 100);
+			};
+
+			const ensurePersistentControllerMonitor = () => {
+				if (persistentControllerMonitorAttached) {
+					return;
+				}
+				navigatorServiceWorker.addEventListener('controllerchange', () => {
+					if (navigatorServiceWorker.controller) {
+						return;
+					}
+					scheduleControllerRecovery();
+				});
+				persistentControllerMonitorAttached = true;
+			};
+
+			ensurePersistentControllerMonitor();
+
+			async function registerServiceWorker() {
+				serviceWorkerRegistrationDepth += 1;
+				try {
+					let storageResult;
+					try {
+						storageResult = await storageAccessReady;
+					} catch (err) {
+						debugWarn('[Webview] storageAccessReady rejected', err);
+					}
+					if (storageResult) {
+						debugWarn('[Webview] storage access status', storageResult);
+					}
+
+					try {
+						const existingRegistration = await navigatorServiceWorker.getRegistration(swScopeString);
+						if (!existingRegistration) {
+							debugWarn('[Webview] No existing service worker registration for scope, resetting reload attempts', { scope: swScopeString });
+							clearReloadFlag();
+						}
+					} catch (err) {
+						debugWarn('[Webview] navigator.serviceWorker.getRegistration failed', err);
+					}
+
+					const purgeStaleServiceWorkers = async () => {
+						if (!currentCommit) {
+							return;
+						}
+						try {
+							const regs = await navigatorServiceWorker.getRegistrations();
+							await Promise.all(regs.map(async (reg) => {
+								const candidateScript = reg.active?.scriptURL ?? reg.waiting?.scriptURL ?? reg.installing?.scriptURL;
+								const regCommit = (extractCommitFromUrl(reg.scope)?.toLowerCase()) ?? (extractCommitFromUrl(candidateScript)?.toLowerCase());
+								if (regCommit && regCommit !== currentCommit) {
+									debugWarn('[Webview] Unregistering stale service worker', { scope: reg.scope, script: candidateScript, regCommit, currentCommit });
+									try {
+										await reg.unregister();
+									} catch (error) {
+										debugWarn('[Webview] Failed to unregister stale service worker', error);
+									}
+								}
+							}));
+						} catch (error) {
+							debugWarn('[Webview] Failed to enumerate existing service workers', error);
+						}
+					};
+					const attemptRegister = async (scriptUrl, options) => {
+						debugWarn('[Webview] attemptRegister', { scriptUrl, options });
+						await purgeStaleServiceWorkers();
+						return navigatorServiceWorker.register(scriptUrl, options ? { ...options, scope: swScopeString } : { scope: swScopeString });
+					};
+					const registerFromSource = async (source) => {
+						if (typeof source !== 'string' || !source.length) {
+							throw new Error('No service worker source provided.');
+						}
+						if (!cachedServiceWorkerBlobUrl) {
+							cachedServiceWorkerBlobUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+						}
+						try {
+							return await attemptRegister(cachedServiceWorkerBlobUrl, { type: 'module' });
+						} catch (error) {
+							debugWarn('Module service worker registration from embedded source failed; retrying without module.', error);
+							return attemptRegister(cachedServiceWorkerBlobUrl);
+						}
+					};
+
+					if (onElectron && !disableServiceWorker && cachedServiceWorkerSourceText) {
+						try {
+							return await registerFromSource(cachedServiceWorkerSourceText);
+						} catch (error) {
+							console.error('Failed to register service worker from embedded source.', error);
+							if (onElectron) {
+								throw error;
+							}
+						}
+					}
+
+					try {
+						return await attemptRegister(swUrlString, { type: 'module' });
+					} catch (error) {
+						const message = error instanceof Error ? (error.message ?? '') : '';
+						const name = error instanceof DOMException ? error.name : undefined;
+						const isScriptFetchError = error instanceof DOMException && name === 'SecurityError' && /fetching the script/i.test(message);
+						if (!onElectron && isScriptFetchError) {
+							debugWarn('Service worker module registration failed; retrying without module support.', error);
+							return attemptRegister(swUrlString);
+						}
+						if (onElectron && !disableServiceWorker && cachedServiceWorkerSourceText) {
+							debugWarn('Service worker module registration failed; retrying with embedded source.', error);
+							return registerFromSource(cachedServiceWorkerSourceText);
+						}
+						throw error;
+					}
+				} finally {
+					serviceWorkerRegistrationDepth = Math.max(0, serviceWorkerRegistrationDepth - 1);
+				}
+			}
+			registerServiceWorker()
 				.then(async registration => {
+					let readyRegistration;
+					try {
+						readyRegistration = await navigatorServiceWorker.ready;
+					} catch (error) {
+						debugWarn('[Webview] Service worker readiness check failed.', error);
+					}
+
 					/**
 					 * @param {MessageEvent} event
 					 */
@@ -266,55 +1215,119 @@
 							return;
 						}
 
-						navigator.serviceWorker.removeEventListener('message', versionHandler);
+						navigatorServiceWorker.removeEventListener('message', versionHandler);
 						if (event.data.version === expectedWorkerVersion) {
 							return resolve();
 						} else {
-							console.log(`Found unexpected service worker version. Found: ${event.data.version}. Expected: ${expectedWorkerVersion}`);
-							console.log(`Attempting to reload service worker`);
+							debugLog(`Found unexpected service worker version. Found: ${event.data.version}. Expected: ${expectedWorkerVersion}`);
+							debugLog(`Attempting to reload service worker`);
 
 							// If we have the wrong version, try once (and only once) to unregister and re-register
 							// Note that `.update` doesn't seem to work desktop electron at the moment so we use
 							// `unregister` and `register` here.
 							return registration.unregister()
-								.then(() => navigator.serviceWorker.register(swPath))
+								.then(() => registerServiceWorker())
 								.finally(() => { resolve(); });
 						}
 					};
-					navigator.serviceWorker.addEventListener('message', versionHandler);
+					navigatorServiceWorker.addEventListener('message', versionHandler);
 
-					const postVersionMessage = (/** @type {ServiceWorker} */ controller) => {
+					const postVersionMessage = (/** @type {ServiceWorker | undefined} */ worker) => {
+						if (!worker) {
+							return false;
+						}
+						if (outerIframeMessageChannel) {
+							try {
+								outerIframeMessageChannel.port1.close();
+							} catch { /*ignore*/ }
+							outerIframeMessageChannel = undefined;
+						}
 						outerIframeMessageChannel = new MessageChannel();
-						controller.postMessage({ channel: 'version' }, [outerIframeMessageChannel.port2]);
+						try {
+							worker.postMessage({ channel: 'version' }, [outerIframeMessageChannel.port2]);
+							return true;
+						} catch (error) {
+							debugWarn('[Webview] Failed to post version message', error);
+							outerIframeMessageChannel = undefined;
+							return false;
+						}
+					};
+
+					const resolveController = () => {
+						const controller = navigatorServiceWorker.controller ?? null;
+						if (
+							controller
+							&& (controller.scriptURL === swUrlString
+								|| controller.scriptURL.endsWith(swUrlSuffix)
+								|| controller.scriptURL === cachedServiceWorkerBlobUrl)
+						) {
+							controllerEstablished = true;
+							postVersionMessage(controller);
+							clearReloadFlag();
+							if (controllerCheckTimer) {
+								clearTimeout(controllerCheckTimer);
+								controllerCheckTimer = undefined;
+							}
+							if (controllerRecoveryTimer) {
+								clearTimeout(controllerRecoveryTimer);
+								controllerRecoveryTimer = undefined;
+							}
+							controllerRecoveryInProgress = false;
+							return true;
+						}
+						return false;
 					};
 
 					// At this point, either the service worker is ready and
 					// became our controller, or we need to wait for it.
 					// Note that navigator.serviceWorker.controller could be a
 					// controller from a previously loaded service worker.
-					const currentController = navigator.serviceWorker.controller;
-					if (currentController?.scriptURL.endsWith(swPath)) {
-						// service worker already loaded & ready to receive messages
-						postVersionMessage(currentController);
-					} else {
-						if (currentController) {
-							console.log(`Found unexpected service worker controller. Found: ${currentController.scriptURL}. Expected: ${swPath}. Waiting for controllerchange.`);
-						} else {
-							console.log(`No service worker controller found. Waiting for controllerchange.`);
-						}
-
-						// Either there's no controlling service worker, or it's an old one.
-						// Wait for it to change before posting the message
-						const onControllerChange = () => {
-							navigator.serviceWorker.removeEventListener('controllerchange', onControllerChange);
-							if (navigator.serviceWorker.controller) {
-								postVersionMessage(navigator.serviceWorker.controller);
-							} else {
-								return reject(new Error('No controller found.'));
-							}
-						};
-						navigator.serviceWorker.addEventListener('controllerchange', onControllerChange);
+					if (resolveController()) {
+						return;
 					}
+
+					const onControllerChange = () => {
+						if (resolveController()) {
+							navigatorServiceWorker.removeEventListener('controllerchange', onControllerChange);
+							return;
+						}
+						if (controllerCheckTimer) {
+							clearTimeout(controllerCheckTimer);
+							controllerCheckTimer = undefined;
+						}
+						if (reloadAttempts < maxReloadAttempts) {
+							markReloadPending();
+						}
+					};
+
+					navigatorServiceWorker.addEventListener('controllerchange', onControllerChange);
+
+					navigatorServiceWorker.ready.then(() => {
+			debugWarn('[Webview] navigator.serviceWorker.ready resolved', { controller: navigatorServiceWorker.controller && navigatorServiceWorker.controller.scriptURL, scope: navigatorServiceWorker.controller && navigatorServiceWorker.controller.scope });
+						if (!controllerEstablished && readyRegistration?.active) {
+							debugLog('[Webview] Posting version message to active worker (pre-controller)', {
+								scriptURL: readyRegistration.active.scriptURL
+							});
+							postVersionMessage(readyRegistration.active);
+						}
+						if (!resolveController() && reloadAttempts < maxReloadAttempts) {
+							if (controllerCheckTimer) {
+								clearTimeout(controllerCheckTimer);
+							}
+							controllerCheckTimer = setTimeout(() => {
+					const controllerScript = navigatorServiceWorker.controller ? navigatorServiceWorker.controller.scriptURL : null;
+					debugWarn('[Webview] controller check timer fired', { controller: controllerScript, attempts: reloadAttempts });
+					if (!navigatorServiceWorker.controller && reloadAttempts < maxReloadAttempts) {
+						markReloadPending();
+					}
+				}, 2000);
+						} else if (!navigatorServiceWorker.controller && reloadAttempts >= maxReloadAttempts) {
+							disableServiceWorkerRouting();
+						}
+					}).catch(error => {
+						debugWarn('[Webview] Service worker ready promise rejected.', error);
+						disableServiceWorkerRouting();
+					});
 				}).catch(error => {
 					if (!onElectron && error instanceof Error && error.message.includes('user denied permission')) {
 						return reject(new Error(`Could not register service worker. Please make sure third party cookies are enabled: ${error}`));
@@ -322,6 +1335,37 @@
 					return reject(new Error(`Could not register service worker: ${error}.`));
 				});
 		});
+
+		const disableServiceWorkerRouting = () => {
+			if (!serviceWorkerRoutingEnabled) {
+				return;
+			}
+			serviceWorkerRoutingEnabled = false;
+			globalThis.__webviewServiceWorkerDisabled = true;
+			debugWarn('[Webview] Falling back to direct resource loading (service worker unavailable)');
+			clearReloadFlag();
+			if (controllerCheckTimer) {
+				clearTimeout(controllerCheckTimer);
+				controllerCheckTimer = undefined;
+			}
+			if (typeof resolveWorkerReady === 'function') {
+				resolveWorkerReady();
+				resolveWorkerReady = undefined;
+			}
+			scheduleCleanup();
+			try {
+				sanitizeResourceAttributes(document);
+				const frames = [getActiveFrame(), getPendingFrame()];
+				for (const frame of frames) {
+					const targetDocument = frame?.contentDocument;
+					if (targetDocument) {
+						sanitizeResourceAttributes(targetDocument);
+					}
+				}
+			} catch (error) {
+				debugWarn('[Webview] Failed to re-sanitize resources during service worker fallback', error);
+			}
+		};
 
 		/**
 		 *  @type {import('../webviewMessages').WebviewHostMessaging}
@@ -342,7 +1386,7 @@
 							handler(e, e.data.args);
 						}
 					} else {
-						console.log('no handler for ', e);
+						debugLog('no handler for ', e);
 					}
 				};
 			}
@@ -366,13 +1410,21 @@
 					window.parent.postMessage({ target: ID, channel: 'webview-ready', data: {} }, parentOrigin, [this.channel.port2]);
 				};
 
-				const parentOrigin = searchParams.get('parentOrigin');
-
 				const hostname = location.hostname;
+				const remoteAuthority = searchParams.get('remoteAuthority');
+				const remoteAuthorityHost = remoteAuthority ? remoteAuthority.split(':')[0] : undefined;
+				const isSecureTransport = location.protocol === 'https:';
+
+				if (!isSecureTransport) {
+					debugWarn('[Webview] Insecure transport detected; skipping parent origin validation.', { protocol: location.protocol, hostname, parentOrigin });
+					start(parentOrigin ?? '*');
+					return;
+				}
 
 				if (!crypto.subtle) {
-					// cannot validate, not running in a secure context
-					throw new Error(`'crypto.subtle' is not available so webviews will not work. This is likely because the editor is not running in a secure context (https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts).`);
+					debugWarn('[Webview] crypto.subtle unavailable in this secure context; skipping parent origin validation.', { hostname, parentOrigin });
+					start(parentOrigin ?? '*');
+					return;
 				}
 
 				// Here the `parentOriginHash()` function from `src/vs/workbench/common/webview.ts` is inlined
@@ -393,6 +1445,10 @@
 
 				if (hostname === parentOriginHash || hostname.startsWith(parentOriginHash + '.')) {
 					// validation succeeded!
+					return start(parentOrigin);
+				}
+
+				if (remoteAuthorityHost && hostname === remoteAuthorityHost) {
 					return start(parentOrigin);
 				}
 
@@ -484,24 +1540,39 @@
 			reduceMotion: false,
 		};
 
-		if (!disableServiceWorker) {
-			hostMessaging.onMessage('did-load-resource', (_event, data) => {
-				assertIsDefined(navigator.serviceWorker.controller).postMessage({ channel: 'did-load-resource', data }, data.data?.buffer ? [data.data.buffer] : []);
-			});
+			if (!disableServiceWorker) {
+				const serviceWorker = navigator.serviceWorker;
+				if (serviceWorker) {
+					hostMessaging.onMessage('did-load-resource', (_event, data) => {
+						const controller = serviceWorker.controller;
+						if (!controller) {
+							debugWarn('[Webview] Service worker controller unavailable for load-resource response.', data);
+							return;
+						}
+						controller.postMessage({ channel: 'did-load-resource', data }, data.data?.buffer ? [data.data.buffer] : []);
+					});
 
-			hostMessaging.onMessage('did-load-localhost', (_event, data) => {
-				assertIsDefined(navigator.serviceWorker.controller).postMessage({ channel: 'did-load-localhost', data });
-			});
+					hostMessaging.onMessage('did-load-localhost', (_event, data) => {
+						const controller = serviceWorker.controller;
+						if (!controller) {
+							debugWarn('[Webview] Service worker controller unavailable for load-localhost response.', data);
+							return;
+						}
+						controller.postMessage({ channel: 'did-load-localhost', data });
+					});
 
-			navigator.serviceWorker.addEventListener('message', event => {
-				switch (event.data.channel) {
-					case 'load-resource':
-					case 'load-localhost':
-						hostMessaging.postMessage(event.data.channel, event.data);
-						return;
+					serviceWorker.addEventListener('message', event => {
+						switch (event.data.channel) {
+							case 'load-resource':
+							case 'load-localhost':
+								hostMessaging.postMessage(event.data.channel, event.data);
+								return;
+						}
+					});
+				} else {
+					debugWarn('[Webview] navigator.serviceWorker unavailable; skipping resource messaging bridge.');
 				}
-			});
-		}
+			}
 
 		/**
 		 * @param {HTMLDocument?} document
@@ -864,7 +1935,7 @@
 
 		/**
 		 * @param {import('../webviewMessages').UpdateContentEvent} data
-		 * @return {string}
+		 * @return {Document}
 		 */
 		function toContentHtml(data) {
 			const options = data.options;
@@ -896,13 +1967,84 @@
 			// Inject default styles
 			newDocument.head.prepend(defaultStyles.cloneNode(true));
 
+			const baseElement = newDocument.querySelector('base');
+			if (baseElement) {
+				const rawHref = baseElement.getAttribute('href');
+				if (rawHref) {
+					try {
+						const decodeHref = (value) => {
+							let result = value;
+							for (let i = 0; i < 3; i++) {
+								try {
+									const decoded = decodeURIComponent(result);
+									if (decoded === result) {
+										break;
+									}
+									result = decoded;
+								} catch {
+									break;
+								}
+							}
+							return result;
+						};
+
+						const decodedRaw = decodeHref(rawHref);
+						let sanitizedHref = ensureResourceScheme(decodedRaw);
+						let decodedSanitized = decodedRaw;
+
+						try {
+							const normalizedUrl = new URL(sanitizedHref);
+							if (resourceBaseAuthority) {
+								const hostPattern = /vscode-resource\.[^/:]+/i;
+								const updatedHost = normalizedUrl.host.replace(hostPattern, resourceBaseAuthority);
+								normalizedUrl.host = updatedHost;
+							}
+							if (resourceBaseScheme) {
+								normalizedUrl.protocol = `${resourceBaseScheme}:`;
+							}
+							normalizedUrl.port = '';
+							sanitizedHref = normalizedUrl.toString();
+							decodedSanitized = decodeHref(sanitizedHref);
+						} catch {
+							if (resourceBaseAuthority) {
+								sanitizedHref = sanitizedHref.replace(/vscode-resource\.[^/]+/i, resourceBaseAuthority);
+							}
+							sanitizedHref = sanitizedHref.replace(/(vscode-resource\.[^/:]+):\d+/i, '$1');
+							decodedSanitized = decodeHref(sanitizedHref);
+						}
+
+						const encodedBase = encodeURIComponent(sanitizedHref);
+						const rewrittenHref = new URL(`./resource/${encodedBase}/`, location.href).toString();
+						baseElement.setAttribute('href', rewrittenHref);
+						rememberResourceBase(sanitizedHref);
+						globalThis.__lastBaseNormalization = {
+							raw: rawHref,
+							decodedRaw,
+							sanitized: sanitizedHref,
+							decodedSanitized,
+							encoded: encodedBase,
+							rewritten: rewrittenHref
+						};
+						debugLog('[WebviewPre] normalized base href', {
+							original: rawHref,
+							sanitized: sanitizedHref,
+							decoded: decodedSanitized,
+							rewritten: rewrittenHref
+						});
+					} catch (error) {
+						debugWarn('[WebviewPre] failed to rewrite base href', { href: rawHref, error });
+					}
+				}
+			}
+
 			applyStyles(newDocument, newDocument.body);
+			sanitizeResourceAttributes(newDocument);
 
 			// Strip out unsupported http-equiv tags
 			for (const metaElement of Array.from(newDocument.querySelectorAll('meta'))) {
 				const httpEquiv = metaElement.getAttribute('http-equiv');
 				if (httpEquiv && !/^(content-security-policy|default-style|content-type)$/i.test(httpEquiv)) {
-					console.warn(`Removing unsupported meta http-equiv: ${httpEquiv}`);
+					debugWarn(`Removing unsupported meta http-equiv: ${httpEquiv}`);
 					metaElement.remove();
 				}
 			}
@@ -913,20 +2055,89 @@
 				hostMessaging.postMessage('no-csp-found', undefined);
 			} else {
 				try {
-					// Attempt to rewrite CSPs that hardcode old-style resource endpoint
 					const cspContent = csp.getAttribute('content');
 					if (cspContent) {
-						const newCsp = cspContent.replace(/(vscode-webview-resource|vscode-resource):(?=(\s|;|$))/g, data.cspSource);
-						csp.setAttribute('content', newCsp);
+						const parsedDirectives = [];
+						const directiveMap = new Map();
+
+						for (const rawPart of cspContent.split(';')) {
+							const part = rawPart.trim();
+							if (!part.length) {
+								continue;
+							}
+
+							const tokens = part.split(/\s+/);
+							const name = tokens.shift();
+							if (!name) {
+								continue;
+							}
+
+							const values = tokens.filter(token => token && !/^'sha\d+-/i.test(token) && !/^'nonce-/i.test(token));
+							const lowerName = name.toLowerCase();
+							const directive = { name: lowerName, values };
+							parsedDirectives.push(directive);
+							directiveMap.set(lowerName, directive);
+						}
+
+						const ensureDirectiveValues = (directiveName, additions) => {
+							const lowerName = directiveName.toLowerCase();
+							let directive = directiveMap.get(lowerName);
+							if (!directive) {
+								directive = { name: lowerName, values: [] };
+								parsedDirectives.push(directive);
+								directiveMap.set(lowerName, directive);
+							}
+
+							if (directive.values.includes("'none'")) {
+								directive.values = directive.values.filter(value => value !== "'none'");
+							}
+
+							for (const value of additions) {
+								if (!directive.values.includes(value)) {
+									directive.values.push(value);
+								}
+							}
+						};
+
+						const rewriteLegacyResourceSchemes = (value) => value.replace(/(vscode-webview-resource|vscode-resource):(?=(\s|;|$))/g, data.cspSource);
+
+						for (const directive of parsedDirectives) {
+							for (let i = 0; i < directive.values.length; i++) {
+								directive.values[i] = rewriteLegacyResourceSchemes(directive.values[i]);
+							}
+						}
+
+						ensureDirectiveValues('default-src', ["'self'", 'https:', 'http:', 'data:', 'blob:']);
+						ensureDirectiveValues('script-src', ["'self'", "'unsafe-inline'", "'unsafe-eval'", 'https:', 'http:', 'blob:']);
+						ensureDirectiveValues('style-src', ["'self'", "'unsafe-inline'", 'https:', 'http:', 'data:']);
+						ensureDirectiveValues('img-src', ["'self'", 'https:', 'http:', 'data:', 'blob:']);
+						ensureDirectiveValues('font-src', ["'self'", 'https:', 'http:', 'data:']);
+						ensureDirectiveValues('connect-src', ["'self'", 'https:', 'http:', 'ws:', 'wss:', 'data:']);
+						ensureDirectiveValues('worker-src', ["'self'", 'https:', 'http:', 'blob:']);
+						ensureDirectiveValues('frame-src', ["'self'", 'https:', 'http:', 'data:', 'blob:']);
+
+						const rebuilt = parsedDirectives.map(directive => {
+							if (!directive.values.length) {
+								return directive.name;
+							}
+							return `${directive.name} ${directive.values.join(' ')}`;
+						}).join('; ');
+
+						csp.setAttribute('content', rebuilt);
 					}
 				} catch (e) {
 					console.error(`Could not rewrite csp: ${e}`);
 				}
 			}
 
-			// set DOCTYPE for newDocument explicitly as DOMParser.parseFromString strips it off
-			// and DOCTYPE is needed in the iframe to ensure that the user agent stylesheet is correctly overridden
-			return '<!DOCTYPE html>\n' + newDocument.documentElement.outerHTML;
+			// Ensure we preserve a DOCTYPE so that the user agent stylesheet behaves as expected inside the iframe.
+			if (!newDocument.doctype) {
+				const docType = newDocument.implementation.createDocumentType('html', '', '');
+				const referenceNode = newDocument.firstChild ?? newDocument.documentElement ?? null;
+				newDocument.insertBefore(docType, referenceNode);
+			}
+
+			return newDocument;
 		}
 
 		// Also forward events before the contents of the webview have loaded
@@ -960,6 +2171,8 @@
 
 				if (target.contentDocument) {
 					applyStyles(target.contentDocument, target.contentDocument.body);
+					sanitizeResourceAttributes(target.contentDocument);
+					registerResourceMutationObserver(target.contentDocument);
 				}
 			});
 
@@ -988,6 +2201,7 @@
 
 				const currentUpdateId = ++updateId;
 				try {
+					globalThis.__lastWebviewHtml = data.contents;
 					await workerReady;
 					perfMark('content/workerReady');
 				} catch (e) {
@@ -1002,6 +2216,7 @@
 
 				const options = data.options;
 				const newDocument = toContentHtml(data);
+				await warmUpResources(newDocument);
 
 				const initialStyleVersion = styleVersion;
 
@@ -1043,9 +2258,8 @@
 				newFrame.setAttribute('id', 'pending-frame');
 				newFrame.setAttribute('frameborder', '0');
 
-				const sandboxRules = new Set(['allow-same-origin', 'allow-pointer-lock']);
+				const sandboxRules = new Set(['allow-same-origin', 'allow-pointer-lock', 'allow-scripts']);
 				if (options.allowScripts) {
-					sandboxRules.add('allow-scripts');
 					sandboxRules.add('allow-downloads');
 				}
 				if (options.allowForms) {
@@ -1071,8 +2285,12 @@
 				newFrame.style.cssText = 'display: block; margin: 0; overflow: hidden; position: absolute; width: 100%; height: 100%; visibility: hidden';
 				document.body.appendChild(newFrame);
 
-				newFrame.contentWindow.addEventListener('keydown', handleInnerKeydown);
-				newFrame.contentWindow.addEventListener('keyup', handleInnerKeyup);
+				if (newFrame.contentWindow) {
+					newFrame.contentWindow.addEventListener('keydown', handleInnerKeydown);
+					newFrame.contentWindow.addEventListener('keyup', handleInnerKeyup);
+				} else {
+					debugWarn('[WebviewPre] pending frame is missing contentWindow', { id: ID, title: data.title });
+				}
 
 				/**
 				 * @param {Document} contentDocument
@@ -1082,14 +2300,133 @@
 
 					// Workaround for https://bugs.chromium.org/p/chromium/issues/detail?id=978325
 					setTimeout(() => {
-						contentDocument.open();
-						contentDocument.write(newDocument);
-						contentDocument.close();
+				debugLog('[WebviewPre] onFrameLoaded start', { id: ID, title: data.title });
+				const targetDocument = contentDocument;
+				if (!targetDocument || !newDocument || !newDocument.documentElement) {
+					debugWarn('[WebviewPre] missing target or source document', {
+						hasTarget: !!targetDocument,
+						hasSource: !!(newDocument && newDocument.documentElement)
+					});
+					return;
+				}
+
+						/**
+						 * @param {Element} source
+						 * @param {Element} target
+						 */
+						const copyAttributes = (source, target) => {
+							if (!source || !target) {
+								return;
+							}
+							while (target.attributes.length) {
+								target.removeAttribute(target.attributes[0].name);
+							}
+							for (const attr of Array.from(source.attributes)) {
+								target.setAttribute(attr.name, attr.value);
+							}
+						};
+
+						/**
+						 * @param {Node} node
+						 * @return {boolean}
+						 */
+						const isHead = (node) => node.nodeType === Node.ELEMENT_NODE && /** @type {Element} */(node).tagName === 'HEAD';
+
+						/**
+						 * @param {Node} node
+						 * @return {boolean}
+						 */
+						const isBody = (node) => node.nodeType === Node.ELEMENT_NODE && /** @type {Element} */(node).tagName === 'BODY';
+
+						/**
+						 * @param {Element | undefined | null} targetParent
+						 * @param {Element | undefined | null} sourceParent
+						 */
+						const syncChildren = (targetParent, sourceParent) => {
+							if (!targetParent || !sourceParent) {
+								return;
+							}
+
+							while (targetParent.firstChild) {
+								targetParent.removeChild(targetParent.firstChild);
+							}
+
+							for (const child of Array.from(sourceParent.childNodes)) {
+								if (child.nodeType === Node.ELEMENT_NODE && /** @type {Element} */(child).tagName === 'SCRIPT') {
+									const sourceScript = /** @type {HTMLScriptElement} */ (child);
+									const newScript = targetDocument.createElement('script');
+									for (const attr of Array.from(sourceScript.attributes)) {
+										newScript.setAttribute(attr.name, attr.value);
+									}
+									if (!sourceScript.src) {
+										newScript.textContent = sourceScript.textContent ?? '';
+									}
+									targetParent.appendChild(newScript);
+								} else {
+									targetParent.appendChild(targetDocument.importNode(child, true));
+								}
+							}
+						};
+
+						const sourceHtml = newDocument.documentElement;
+						const targetHtml = targetDocument.documentElement || targetDocument.appendChild(targetDocument.createElement('html'));
+
+						const sourceDocType = newDocument.doctype;
+						const targetDocType = targetDocument.doctype;
+						if (sourceDocType) {
+							const needsReplacement = !targetDocType
+								|| targetDocType.name !== sourceDocType.name
+								|| targetDocType.publicId !== sourceDocType.publicId
+								|| targetDocType.systemId !== sourceDocType.systemId;
+							if (needsReplacement) {
+								const replacement = targetDocument.implementation.createDocumentType(
+									sourceDocType.name,
+									sourceDocType.publicId,
+									sourceDocType.systemId
+								);
+								if (targetDocType) {
+									targetDocument.replaceChild(replacement, targetDocType);
+								} else {
+									targetDocument.insertBefore(replacement, targetHtml);
+								}
+							}
+						} else if (targetDocType) {
+							targetDocument.removeChild(targetDocType);
+						}
+
+						copyAttributes(sourceHtml, targetHtml);
+
+						const sourceHead = Array.from(sourceHtml.childNodes).find(isHead);
+						const sourceBody = Array.from(sourceHtml.childNodes).find(isBody);
+
+						const newHead = targetDocument.createElement('head');
+						const newBody = targetDocument.createElement('body');
+
+						copyAttributes(/** @type {Element} */ (sourceHead), newHead);
+						copyAttributes(/** @type {Element} */ (sourceBody), newBody);
+
+						syncChildren(newHead, /** @type {Element} */ (sourceHead));
+						syncChildren(newBody, /** @type {Element} */ (sourceBody));
+
+						const extraNodes = [];
+						for (const child of Array.from(sourceHtml.childNodes)) {
+							if (!isHead(child) && !isBody(child)) {
+								extraNodes.push(targetDocument.importNode(child, true));
+							}
+						}
+
+				targetHtml.replaceChildren(newHead, newBody, ...extraNodes);
+				targetDocument.title = newDocument.title || '';
+				debugLog('[WebviewPre] DOM sync complete', { id: ID, title: data.title });
+				sanitizeResourceAttributes(targetDocument);
+				registerResourceMutationObserver(targetDocument);
+
 						hookupOnLoadHandlers(newFrame);
 						perfMark('content/wroteInnerContent')
 
 						if (initialStyleVersion !== styleVersion) {
-							applyStyles(contentDocument, contentDocument.body);
+							applyStyles(targetDocument, targetDocument.body);
+							sanitizeResourceAttributes(targetDocument);
 						}
 					}, 0);
 				}
@@ -1111,10 +2448,11 @@
 						}
 					}, 10);
 				} else {
-					assertIsDefined(newFrame.contentWindow).addEventListener('DOMContentLoaded', e => {
-						const contentDocument = e.target ? (/** @type {HTMLDocument} */ (e.target)) : undefined;
-						onFrameLoaded(assertIsDefined(contentDocument));
-					});
+				assertIsDefined(newFrame.contentWindow).addEventListener('DOMContentLoaded', e => {
+					const contentDocument = e.target ? (/** @type {HTMLDocument} */ (e.target)) : undefined;
+					debugLog('[WebviewPre] DOMContentLoaded fired', { id: ID, title: data.title });
+					onFrameLoaded(assertIsDefined(contentDocument));
+				});
 				}
 
 				/**
@@ -1136,6 +2474,7 @@
 						// Styles may have changed since we created the element. Make sure we re-style
 						if (initialStyleVersion !== styleVersion) {
 							applyStyles(newFrame.contentDocument, newFrame.contentDocument.body);
+							sanitizeResourceAttributes(newFrame.contentDocument);
 						}
 						newFrame.setAttribute('id', 'active-frame');
 						newFrame.style.visibility = 'visible';
@@ -1178,10 +2517,18 @@
 					loadTimeout = setTimeout(() => {
 						clearTimeout(loadTimeout);
 						loadTimeout = undefined;
-						onLoad(assertIsDefined(newFrame.contentDocument), assertIsDefined(newFrame.contentWindow));
+						if (newFrame.contentDocument && newFrame.contentWindow) {
+							onLoad(newFrame.contentDocument, newFrame.contentWindow);
+						} else {
+							debugWarn('[WebviewPre] pending frame missing document/window on timeout', { id: ID, title: data.title });
+						}
 					}, 200);
 
-					const contentWindow = assertIsDefined(newFrame.contentWindow);
+					const contentWindow = newFrame.contentWindow;
+					if (!contentWindow) {
+						debugWarn('[WebviewPre] cannot attach load handler; missing contentWindow', { id: ID, title: data.title });
+						return;
+					}
 
 					contentWindow.addEventListener('load', function (e) {
 						const contentDocument = /** @type {Document} */ (e.target);

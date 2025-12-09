@@ -22,3 +22,6 @@ product.overrides.json
 *.snap.actual
 *.tsbuildinfo
 .vscode-test
+/notes/
+/scripts/
+/.openmcp/

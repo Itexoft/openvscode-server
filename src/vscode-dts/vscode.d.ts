@@ -3,6 +3,11 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+/// <reference lib="es2024" />
+/// <reference lib="es2018.asynciterable" />
+/// <reference lib="dom" />
+/// <reference lib="dom.iterable" />
+
 declare module 'vscode' {
 
 	/**

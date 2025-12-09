@@ -175,6 +175,11 @@ export interface IWorkbenchConstructionOptions {
 	readonly webviewEndpoint?: string;
 
 	/**
+	 * Unique version identifier passed to the webview service worker to break caches.
+	 */
+	readonly webviewServiceWorkerVersion?: string;
+
+	/**
 	 * A factory for web sockets.
 	 */
 	readonly webSocketFactory?: IWebSocketFactory;

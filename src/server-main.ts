@@ -6,6 +6,8 @@
 import './bootstrap-server.js'; // this MUST come before other imports as it changes global state
 import * as path from 'node:path';
 import * as http from 'node:http';
+import * as https from 'node:https';
+import * as fs from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import * as os from 'node:os';
 import * as readline from 'node:readline';
@@ -36,6 +38,30 @@ const parsedArgs = minimist(process.argv.slice(2), {
 		}
 	}
 });
+
+['tls-cert', 'tls-key', 'tls-passphrase'].forEach(e => {
+	if (!parsedArgs[e]) {
+		const envValue = process.env[`VSCODE_SERVER_${e.toUpperCase().replace('-', '_')}`];
+		if (envValue) {
+			parsedArgs[e] = envValue;
+		}
+	}
+});
+
+if (!parsedArgs['tls-ca']) {
+	const envValue = process.env['VSCODE_SERVER_TLS_CA'];
+	if (envValue) {
+		parsedArgs['tls-ca'] = envValue.split(path.delimiter);
+	}
+}
+
+if (typeof parsedArgs['tls-client-cert-required'] === 'undefined') {
+	const envValue = process.env['VSCODE_SERVER_TLS_CLIENT_CERT_REQUIRED'];
+	if (typeof envValue === 'string') {
+		const normalized = envValue.trim().toLowerCase();
+		parsedArgs['tls-client-cert-required'] = ['1', 'true', 'yes', 'on'].includes(normalized);
+	}
+}
 
 const extensionLookupArgs = ['list-extensions', 'locate-extension'];
 const extensionInstallArgs = ['install-extension', 'install-builtin-extension', 'uninstall-extension', 'update-extensions'];
@@ -79,20 +105,54 @@ if (shouldSpawnCli) {
 				process.exit(1);
 			}
 		}
-	}
+}
 
 	let firstRequest = true;
 	let firstWebSocket = true;
 
-	let address: string | AddressInfo | null = null;
-	const server = http.createServer(async (req, res) => {
+	const tlsCertPath = sanitizeStringArg(parsedArgs['tls-cert']);
+	const tlsKeyPath = sanitizeStringArg(parsedArgs['tls-key']);
+	const tlsPassphrase = sanitizeStringArg(parsedArgs['tls-passphrase']);
+	const tlsClientCertRequired = !!parsedArgs['tls-client-cert-required'];
+	const tlsCaPaths = coerceToStringArray(parsedArgs['tls-ca']);
+
+	let httpsOptions: https.ServerOptions | undefined;
+	if (tlsCertPath || tlsKeyPath || tlsPassphrase || tlsClientCertRequired || (tlsCaPaths && tlsCaPaths.length)) {
+		if (!tlsCertPath || !tlsKeyPath) {
+			console.error('Both --tls-cert and --tls-key must be provided to enable TLS.');
+			process.exit(1);
+		}
+		if (tlsClientCertRequired && (!tlsCaPaths || tlsCaPaths.length === 0)) {
+			console.error('--tls-client-cert-required must be combined with at least one --tls-ca option.');
+			process.exit(1);
+		}
+		const cert = readTlsFileOrExit('TLS certificate', tlsCertPath);
+		const key = readTlsFileOrExit('TLS key', tlsKeyPath);
+		const ca = tlsCaPaths?.map(caPath => caPath.trim()).filter(caPath => !!caPath).map(caPath => readTlsFileOrExit('TLS certificate authority', caPath));
+
+		httpsOptions = {
+			cert,
+			key,
+			passphrase: tlsPassphrase,
+			rejectUnauthorized: tlsClientCertRequired || undefined,
+			requestCert: tlsClientCertRequired || undefined,
+			ca: ca && ca.length ? ca : undefined
+		};
+	}
+
+	const protocol = httpsOptions ? 'https' : 'http';
+
+	const requestHandler = async (req: http.IncomingMessage, res: http.ServerResponse) => {
 		if (firstRequest) {
 			firstRequest = false;
 			perf.mark('code/server/firstRequest');
 		}
 		const remoteExtensionHostAgentServer = await getRemoteExtensionHostAgentServer();
 		return remoteExtensionHostAgentServer.handleRequest(req, res);
-	});
+	};
+
+	let address: string | AddressInfo | null = null;
+	const server = httpsOptions ? https.createServer(httpsOptions, requestHandler) : http.createServer(requestHandler);
 	server.on('upgrade', async (req, socket) => {
 		if (firstWebSocket) {
 			firstWebSocket = false;
@@ -132,7 +192,8 @@ if (shouldSpawnCli) {
 			throw new Error('Unexpected server address');
 		}
 
-		output += `Server bound to ${typeof address === 'string' ? address : `${address.address}:${address.port} (${address.family})`}\n`;
+		const boundDescription = typeof address === 'string' ? address : `${address.address}:${address.port} (${address.family})`;
+		output += `Server bound (${protocol}) to ${boundDescription}\n`;
 		// Do not change this line. VS Code looks for this in the output.
 		output += `Extension host agent listening on ${typeof address === 'string' ? address : address.port}\n`;
 		console.log(output);
@@ -156,6 +217,27 @@ function sanitizeStringArg(val: any): string | undefined {
 		val = val.pop(); // take the last item
 	}
 	return typeof val === 'string' ? val : undefined;
+}
+
+function coerceToStringArray(val: any): string[] | undefined {
+	if (typeof val === 'string') {
+		return [val];
+	}
+	if (Array.isArray(val)) {
+		return val.filter((item): item is string => typeof item === 'string');
+	}
+	return undefined;
+}
+
+function readTlsFileOrExit(label: string, filePath: string): Buffer {
+	const resolved = path.resolve(filePath);
+	try {
+		return fs.readFileSync(resolved);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(`Failed to read ${label} at ${resolved}: ${message}`);
+		process.exit(1);
+	}
 }
 
 /**

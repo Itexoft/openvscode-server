@@ -56,30 +56,94 @@ export async function loadLocalResource(
 
 	logService.trace(`Webview.loadLocalResource - trying to load resource. requestUri=${requestUri}, resourceToLoad=${resourceToLoad}`);
 
-	if (!resourceToLoad) {
+	try {
+		const requestStore = (globalThis as any).__webviewResourceRequests as Array<{ request: string; scheme: string; hasRoot: boolean; timestamp: number }> | undefined;
+		const entry = { request: requestUri.toString(true), scheme: requestUri.scheme, hasRoot: !!resourceToLoad, timestamp: Date.now() };
+		if (Array.isArray(requestStore)) {
+			requestStore.push(entry);
+		} else {
+			(globalThis as any).__webviewResourceRequests = [entry];
+		}
+	} catch {
+		// ignore diagnostic failures
+	}
+
+	let resolvedResource = resourceToLoad;
+
+	if (!resolvedResource) {
+		resolvedResource = normalizeResourcePath(requestUri);
+		logService.warn(`Webview.loadLocalResource - falling back to normalized remote resource without explicit root`, {
+			request: requestUri.toString(true),
+			roots: options.roots.map(root => root.toString(true))
+		});
+		try {
+			const fallbackStore = (globalThis as any).__webviewResourceFallbacks as Array<{ request: string; timestamp: number }> | undefined;
+			if (Array.isArray(fallbackStore)) {
+				fallbackStore.push({ request: requestUri.toString(true), timestamp: Date.now() });
+			} else {
+				(globalThis as any).__webviewResourceFallbacks = [{ request: requestUri.toString(true), timestamp: Date.now() }];
+			}
+		} catch {
+			// ignore diagnostic failures
+		}
+	}
+
+	if (!resolvedResource) {
 		logService.trace(`Webview.loadLocalResource - access denied. requestUri=${requestUri}, resourceToLoad=${resourceToLoad}`);
+		logService.warn(`Webview.loadLocalResource - denied`, {
+			request: requestUri.toString(true),
+			roots: options.roots.map(root => root.toString(true))
+		});
 		return WebviewResourceResponse.AccessDenied;
 	}
 
 	const mime = getWebviewContentMimeType(requestUri); // Use the original path for the mime
 
 	try {
-		const result = await fileService.readFileStream(resourceToLoad, { etag: options.ifNoneMatch }, token);
-		logService.trace(`Webview.loadLocalResource - Loaded. requestUri=${requestUri}, resourceToLoad=${resourceToLoad}`);
+		const result = await fileService.readFileStream(resolvedResource, { etag: options.ifNoneMatch }, token);
+		logService.trace(`Webview.loadLocalResource - Loaded. requestUri=${requestUri}, resourceToLoad=${resolvedResource}`);
 		return new WebviewResourceResponse.StreamSuccess(result.value, result.etag, result.mtime, mime);
 	} catch (err) {
+		const isNotFound =
+			err instanceof FileOperationError &&
+			err.fileOperationResult === FileOperationResult.FILE_NOT_FOUND;
+
+		if (isNotFound) {
+			const fallbackUri = getSourceMapFallbackUri(requestUri);
+			if (fallbackUri) {
+				const fallbackResource =
+					getResourceToLoad(fallbackUri, options.roots) ??
+					normalizeResourcePath(fallbackUri);
+
+				if (fallbackResource) {
+					try {
+						const fallbackResult = await fileService.readFileStream(fallbackResource, { etag: options.ifNoneMatch }, token);
+						logService.trace(`Webview.loadLocalResource - Loaded via sourcemap fallback. requestUri=${requestUri}, resourceToLoad=${fallbackResource}`);
+						return new WebviewResourceResponse.StreamSuccess(
+							fallbackResult.value,
+							fallbackResult.etag,
+							fallbackResult.mtime,
+							mime,
+						);
+					} catch {
+						// fall through to the original error handling
+					}
+				}
+			}
+		}
+
 		if (err instanceof FileOperationError) {
 			const result = err.fileOperationResult;
 
 			// NotModified status is expected and can be handled gracefully
 			if (result === FileOperationResult.FILE_NOT_MODIFIED_SINCE) {
-				logService.trace(`Webview.loadLocalResource - not modified. requestUri=${requestUri}, resourceToLoad=${resourceToLoad}`);
+				logService.trace(`Webview.loadLocalResource - not modified. requestUri=${requestUri}, resourceToLoad=${resolvedResource}`);
 				return new WebviewResourceResponse.NotModified(mime, (err.options as IWriteFileOptions | undefined)?.mtime);
 			}
 		}
 
 		// Otherwise the error is unexpected.
-		logService.error(`Webview.loadLocalResource - Error using fileReader. requestUri=${requestUri}, resourceToLoad=${resourceToLoad}`);
+		logService.error(`Webview.loadLocalResource - Error using fileReader. requestUri=${requestUri}, resourceToLoad=${resolvedResource}`);
 		return WebviewResourceResponse.Failed;
 	}
 }
@@ -98,7 +162,11 @@ function getResourceToLoad(
 }
 
 function containsResource(root: URI, resource: URI): boolean {
-	if (root.scheme !== resource.scheme) {
+	const isFileLikePair =
+		(root.scheme === Schemas.file && resource.scheme === Schemas.vscodeRemote) ||
+		(root.scheme === Schemas.vscodeRemote && resource.scheme === Schemas.file);
+
+	if (root.scheme !== resource.scheme && !isFileLikePair) {
 		return false;
 	}
 
@@ -111,6 +179,18 @@ function containsResource(root: URI, resource: URI): boolean {
 	}
 
 	return resourceFsPath.startsWith(rootPath);
+}
+
+function getSourceMapFallbackUri(requestUri: URI): URI | undefined {
+	const lowerPath = requestUri.path.toLowerCase();
+	const remap = (from: string, to: string): URI | undefined => {
+		if (lowerPath.endsWith(from)) {
+			return requestUri.with({ path: requestUri.path.slice(0, -from.length) + to });
+		}
+		return undefined;
+	};
+
+	return remap('.map.json', '.js.map') ?? remap('.sourcemap', '.js.map');
 }
 
 function normalizeResourcePath(resource: URI): URI {

@@ -220,14 +220,47 @@ export class BrowserWorkbenchEnvironmentService implements IBrowserWorkbenchEnvi
 
 	@memoize
 	get webviewExternalEndpoint(): string {
-		const endpoint = this.options.webviewEndpoint
+		const endpointTemplate = this.options.webviewEndpoint
 			|| this.productService.webviewContentExternalBaseUrlTemplate
 			|| 'https://{{uuid}}.vscode-cdn.net/{{quality}}/{{commit}}/out/vs/workbench/contrib/webview/browser/pre/';
 
 		const webviewExternalEndpointCommit = this.payload?.get('webviewExternalEndpointCommit');
-		return endpoint
+		const uuidToken = '{{uuid}}';
+		const uuidPlaceholder = '00000000000000000000000000000000';
+
+		let endpoint = endpointTemplate
 			.replace('{{commit}}', webviewExternalEndpointCommit ?? this.productService.commit ?? 'ef65ac1ba57f57f2a3961bfe94aa20481caca4c6')
 			.replace('{{quality}}', (webviewExternalEndpointCommit ? 'insider' : this.productService.quality) ?? 'insider');
+
+		const endpointForParse = endpoint.includes(uuidToken) ? endpoint.replace(uuidToken, uuidPlaceholder) : endpoint;
+		try {
+			const parsed = new URL(endpointForParse);
+			const loc = typeof globalThis !== 'undefined' ? globalThis.location : undefined;
+			if (loc && typeof loc.host === 'string' && loc.host) {
+				const protocol = typeof loc.protocol === 'string' && loc.protocol ? loc.protocol : parsed.protocol;
+				parsed.protocol = protocol;
+				parsed.host = loc.host;
+			}
+
+			// Drop oss-<commit> segment if present; runtime static lives at /static/out.
+			const pathSegments = parsed.pathname.split('/').filter(Boolean);
+			if (pathSegments.length && /^oss-[^/]+$/i.test(pathSegments[0])) {
+				pathSegments.shift();
+				parsed.pathname = '/' + pathSegments.join('/');
+			}
+
+			const serialized = parsed.toString();
+			endpoint = endpoint.includes(uuidToken) ? serialized.replace(uuidPlaceholder, uuidToken) : serialized;
+		} catch {
+			// ignore parse failures and fall back to the computed template
+		}
+
+		return endpoint;
+	}
+
+	@memoize
+	get webviewServiceWorkerVersion(): string | undefined {
+		return this.options.webviewServiceWorkerVersion ?? this.productService.webviewServiceWorkerVersion;
 	}
 
 	@memoize
@@ -268,9 +301,16 @@ export class BrowserWorkbenchEnvironmentService implements IBrowserWorkbenchEnvi
 		readonly options: IWorkbenchConstructionOptions,
 		private readonly productService: IProductService
 	) {
-		if (options.workspaceProvider && Array.isArray(options.workspaceProvider.payload)) {
+		if (options.workspaceProvider) {
+			const payload = options.workspaceProvider.payload;
 			try {
-				this.payload = new Map(options.workspaceProvider.payload);
+				if (Array.isArray(payload)) {
+					this.payload = new Map(payload);
+				} else if (payload && typeof payload === 'object') {
+					this.payload = new Map(
+						Object.entries(payload).map(([key, value]) => [key, String(value)]),
+					);
+				}
 			} catch (error) {
 				onUnexpectedError(error); // possible invalid payload for map
 			}
@@ -323,6 +363,12 @@ export class BrowserWorkbenchEnvironmentService implements IBrowserWorkbenchEnvi
 						extensionHostDebugEnvironment.extensionEnabledProposedApi = [];
 						break;
 				}
+			}
+		}
+
+		if (extensionHostDebugEnvironment.extensionEnabledProposedApi === undefined) {
+			if ((globalThis as any).__openvscodeEnableAllProposedApi === true) {
+				extensionHostDebugEnvironment.extensionEnabledProposedApi = [];
 			}
 		}
 

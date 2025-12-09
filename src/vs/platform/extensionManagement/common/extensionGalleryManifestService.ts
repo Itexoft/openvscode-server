@@ -77,10 +77,6 @@ function createResources(config: ExtensionGalleryConfig): ExtensionGalleryManife
 			type: ExtensionGalleryResourceType.ExtensionQueryService
 		},
 		{
-			id: config.extensionUrlTemplate ?? `${config.serviceUrl}/vscode/{publisher}/{name}/latest`,
-			type: ExtensionGalleryResourceType.ExtensionLatestVersionUri
-		},
-		{
 			id: `${config.serviceUrl}/publishers/{publisher}/extensions/{name}/{version}/stats?statType={statTypeName}`,
 			type: ExtensionGalleryResourceType.ExtensionStatisticsUri
 		},
@@ -89,6 +85,14 @@ function createResources(config: ExtensionGalleryConfig): ExtensionGalleryManife
 			type: ExtensionGalleryResourceType.WebExtensionStatisticsUri
 		},
 	];
+
+	const latestVersionTemplate = config.extensionUrlTemplate;
+	if (latestVersionTemplate) {
+		resources.push({
+			id: latestVersionTemplate,
+			type: ExtensionGalleryResourceType.ExtensionLatestVersionUri
+		});
+	}
 
 	if (config.publisherUrl) {
 		resources.push({
@@ -152,8 +156,8 @@ function toMarketplaceManifest(config: ExtensionGalleryConfig): IExtensionGaller
 export class ExtensionGalleryManifestService extends Disposable implements IExtensionGalleryManifestService {
 
 	readonly _serviceBrand: undefined;
-	readonly onDidChangeExtensionGalleryManifest = Event.None;
-	readonly onDidChangeExtensionGalleryManifestStatus = Event.None;
+	readonly onDidChangeExtensionGalleryManifest: Event<IExtensionGalleryCompositeManifest | null> = Event.None;
+	readonly onDidChangeExtensionGalleryManifestStatus: Event<ExtensionGalleryManifestStatus> = Event.None;
 
 	constructor(
 		@IProductService protected readonly productService: IProductService,

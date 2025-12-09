@@ -652,7 +652,7 @@ class ProcAutomaticPortForwarding extends Disposable {
 
 	private async initialize() {
 		if (!this.remoteExplorerService.tunnelModel.environmentTunnelsSet) {
-			await new Promise<void>(resolve => this.remoteExplorerService.tunnelModel.onEnvironmentTunnelsSet(() => resolve()));
+			await Event.toPromise(this.remoteExplorerService.tunnelModel.onEnvironmentTunnelsSet);
 		}
 
 		this._register(this.configurationService.onDidChangeConfiguration(async (e) => {
@@ -705,7 +705,7 @@ class ProcAutomaticPortForwarding extends Disposable {
 		}
 		let startingCandidates = this.remoteExplorerService.tunnelModel.candidatesOrUndefined;
 		if (!startingCandidates) {
-			await new Promise<void>(resolve => this.remoteExplorerService.tunnelModel.onCandidatesChanged(() => resolve()));
+			await Event.toPromise(this.remoteExplorerService.tunnelModel.onCandidatesChanged);
 			startingCandidates = this.remoteExplorerService.tunnelModel.candidates;
 		}
 

@@ -27,12 +27,13 @@ import { ExtensionIdentifier } from '../../../../platform/extensions/common/exte
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
+import { IProductService } from '../../../../platform/product/common/productService.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { IRemoteAuthorityResolverService } from '../../../../platform/remote/common/remoteAuthorityResolver.js';
 import { ITunnelService } from '../../../../platform/tunnel/common/tunnel.js';
 import { WebviewPortMappingManager } from '../../../../platform/webview/common/webviewPortMapping.js';
 import { IWorkbenchEnvironmentService } from '../../../services/environment/common/environmentService.js';
-import { decodeAuthority, webviewGenericCspSource, webviewRootResourceAuthority } from '../common/webview.js';
+import { decodeAuthority, webviewGenericCspSource, webviewResourceBaseScheme, webviewRootResourceAuthority } from '../common/webview.js';
 import { loadLocalResource, WebviewResourceResponse } from './resourceLoading.js';
 import { WebviewThemeDataProvider } from './themeing.js';
 import { areWebviewContentOptionsEqual, IWebviewElement, WebviewContentOptions, WebviewExtensionDescription, WebviewInitInfo, WebviewMessageReceivedEvent, WebviewOptions } from './webview.js';
@@ -96,7 +97,7 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 
 	protected get platform(): string { return 'browser'; }
 
-	private readonly _expectedServiceWorkerVersion = 4; // Keep this in sync with the version in service-worker.js
+	private readonly _expectedServiceWorkerVersion: string;
 
 	private _element: HTMLIFrameElement | undefined;
 	protected get element(): HTMLIFrameElement | undefined { return this._element; }
@@ -162,9 +163,14 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 		@IRemoteAuthorityResolverService private readonly _remoteAuthorityResolverService: IRemoteAuthorityResolverService,
 		@ITunnelService private readonly _tunnelService: ITunnelService,
 		@IInstantiationService instantiationService: IInstantiationService,
+		@IProductService productService: IProductService,
 		@IAccessibilityService private readonly _accessibilityService: IAccessibilityService,
 	) {
 		super();
+
+		const candidateServiceWorkerVersion = this._environmentService.webviewServiceWorkerVersion ?? productService.webviewServiceWorkerVersion;
+		this._expectedServiceWorkerVersion = candidateServiceWorkerVersion && candidateServiceWorkerVersion.length > 8 ? candidateServiceWorkerVersion : 'auto';
+		(globalThis as any).__openvscodeLastWebviewSwVersion = this._expectedServiceWorkerVersion;
 
 		this.providedViewType = initInfo.providedViewType;
 		this.origin = initInfo.origin ?? this.id;
@@ -271,6 +277,13 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 
 		this._register(this.on('load-resource', async (entry) => {
 			try {
+				console.log('[WebviewHost] load-resource', {
+					id: entry.id,
+					scheme: entry.scheme,
+					authority: entry.authority,
+					path: entry.path,
+					query: entry.query
+				});
 				// Restore the authority we previously encoded
 				const authority = decodeAuthority(entry.authority);
 				const uri = URI.from({
@@ -401,7 +414,6 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 		element.name = this.id;
 		element.className = `webview ${options.customClasses || ''}`;
 		element.sandbox.add('allow-scripts', 'allow-same-origin', 'allow-forms', 'allow-pointer-lock', 'allow-downloads');
-
 		const allowRules = ['cross-origin-isolated', 'autoplay'];
 		if (!isFirefox) {
 			allowRules.push('clipboard-read', 'clipboard-write');
@@ -425,12 +437,52 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 			id: this.id,
 			parentId: targetWindow.vscodeWindowId.toString(),
 			origin: this.origin,
-			swVersion: String(this._expectedServiceWorkerVersion),
+			swVersion: this._expectedServiceWorkerVersion,
 			extensionId: extension?.id.value ?? '',
 			platform: this.platform,
-			'vscode-resource-base-authority': webviewRootResourceAuthority,
+			'vscode-resource-base-authority': (() => {
+				try {
+					const host = new URL(targetWindow.location.origin).host;
+					// When the resolver points at the CDN host, force it to the local host:port
+					// so that resources are served by the running server (avoids 404/offline).
+					if (webviewRootResourceAuthority?.includes('vscode-cdn.net')) {
+						return `vscode-resource.${host}`;
+					}
+				} catch {
+					// fall back to provided authority
+				}
+				return webviewRootResourceAuthority;
+			})(),
+			'vscode-resource-base-scheme': webviewResourceBaseScheme,
 			parentOrigin: targetWindow.origin,
 		};
+
+		// Propagate connection token if present in the outer window query.
+		try {
+			const outerParams = new URLSearchParams(targetWindow.location.search);
+			const connectionToken = outerParams.get('tkn');
+			if (connectionToken) {
+				params.tkn = connectionToken;
+			}
+		} catch {
+			// ignore parse errors
+		}
+
+		// Fallback: propagate token from cookie if not already set.
+		if (!params.tkn) {
+			try {
+				const cookieToken = targetWindow.document.cookie
+					.split(';')
+					.map(part => part.trim())
+					.map(part => part.split('='))
+					.find(([name]) => name === 'vscode-tkn')?.[1];
+				if (cookieToken) {
+					params.tkn = cookieToken;
+				}
+			} catch {
+				// ignore cookie access issues
+			}
+		}
 
 		if (this._options.disableServiceWorker) {
 			params.disableServiceWorker = 'true';
@@ -490,7 +542,7 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 	}
 
 	private _registerMessageHandler(targetWindow: CodeWindow) {
-		const subscription = this._register(addDisposableListener(targetWindow, 'message', (e: MessageEvent) => {
+		this._register(addDisposableListener(targetWindow, 'message', (e: MessageEvent) => {
 			if (!this._encodedWebviewOrigin || e?.data?.target !== this.id) {
 				return;
 			}
@@ -501,12 +553,18 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 			}
 
 			if (e.data.channel === 'webview-ready') {
-				if (this._messagePort) {
-					return;
-				}
-
+				const isReload = !!this._messagePort;
 				this.perfMark('webview-ready');
-				this._logService.trace(`Webview(${this.id}): webview ready`);
+				this._logService.trace(`Webview(${this.id}): webview ready${isReload ? ' (reconnected)' : ''}`);
+
+				if (this._messagePort) {
+					try {
+						this._messagePort.onmessage = null;
+						this._messagePort.close();
+					} catch (error) {
+						this._logService.debug(`Webview(${this.id}): failed to close previous message port`, error);
+					}
+				}
 
 				this._messagePort = e.ports[0];
 				this._messagePort.onmessage = (e) => {
@@ -522,10 +580,17 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 
 				if (this._state.type === WebviewState.Type.Initializing) {
 					this._state.pendingMessages.forEach(({ channel, data, resolve }) => resolve(this.doPostMessage(channel, data)));
+				} else {
+					this.reload();
+					this.style();
+					if (typeof this._confirmBeforeClose !== 'undefined') {
+						this._send('set-confirm-before-close', this._confirmBeforeClose);
+					}
+					if (this._focused) {
+						this._send('focus', undefined);
+					}
 				}
 				this._state = WebviewState.Ready;
-
-				subscription.dispose();
 			}
 		}));
 	}
@@ -758,45 +823,117 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 	}
 
 	private async loadResource(id: number, uri: URI, ifNoneMatch: string | undefined) {
+		let loadResult: WebviewResourceResponse.StreamResponse | undefined;
 		try {
-			const result = await loadLocalResource(uri, {
+			const roots = this._content.options.localResourceRoots?.map(root => root.toString(true)) ?? [];
+			console.log('[WebviewHost] localResourceRoots', roots);
+			this._logService.warn(`WebviewHost(${this.id}) load-resource`, { roots, uri: uri.toString(true) });
+			(globalThis as any).__lastLocalResourceRoots = roots;
+			loadResult = await loadLocalResource(uri, {
 				ifNoneMatch,
 				roots: this._content.options.localResourceRoots || [],
 			}, this._fileService, this._logService, this._resourceLoadingCts.token);
+			(globalThis as any).__lastRequestedResource = uri.toString(true);
 
-			switch (result.type) {
+			switch (loadResult.type) {
 				case WebviewResourceResponse.Type.Success: {
-					const buffer = await this.streamToBuffer(result.stream);
+					const buffer = await this.streamToBuffer(loadResult.stream);
+					(globalThis as any).__lastLoadLocalResourceResult = {
+						webviewId: this.id,
+						id,
+						status: 'success',
+						uri: uri.toString(true),
+						mime: loadResult.mimeType,
+						etag: loadResult.etag,
+						mtime: loadResult.mtime
+					};
 					return this._send('did-load-resource', {
 						id,
 						status: 200,
 						path: uri.path,
-						mime: result.mimeType,
+						mime: loadResult.mimeType,
 						data: buffer,
-						etag: result.etag,
-						mtime: result.mtime
+						etag: loadResult.etag,
+						mtime: loadResult.mtime
 					}, [buffer]);
 				}
 				case WebviewResourceResponse.Type.NotModified: {
+					(globalThis as any).__lastLoadLocalResourceResult = {
+						webviewId: this.id,
+						id,
+						status: 'not-modified',
+						uri: uri.toString(true),
+						mime: loadResult.mimeType,
+						mtime: loadResult.mtime
+					};
 					return this._send('did-load-resource', {
 						id,
 						status: 304, // not modified
 						path: uri.path,
-						mime: result.mimeType,
-						mtime: result.mtime
+						mime: loadResult.mimeType,
+						mtime: loadResult.mtime
 					});
 				}
 				case WebviewResourceResponse.Type.AccessDenied: {
+					(globalThis as any).__lastLoadLocalResourceResult = {
+						webviewId: this.id,
+						id,
+						status: 'access-denied',
+						uri: uri.toString(true)
+					};
 					return this._send('did-load-resource', {
 						id,
 						status: 401, // unauthorized
 						path: uri.path,
 					});
 				}
+			case WebviewResourceResponse.Type.Failed: {
+				(globalThis as any).__lastLoadLocalResourceResult = {
+					webviewId: this.id,
+					id,
+					status: 'failed',
+					uri: uri.toString(true)
+				};
+				this._logService.warn(`WebviewHost(${this.id}) load-resource returned Failed`, { id, uri: uri.toString(true), roots: this._content.options.localResourceRoots?.map(r => r.toString(true)) ?? [] });
+				console.warn('[WebviewHost] load-resource failed (resource response failed)', {
+					webview: this.id,
+					id,
+					uri: uri.toString(true)
+				});
+				break;
 			}
-		} catch {
-			// noop
+			}
+			(globalThis as any).__lastLoadLocalResourceResult = {
+				webviewId: this.id,
+				id,
+				status: loadResult?.type,
+				uri: uri.toString(true)
+			};
+		} catch (error) {
+			this._logService.error(`WebviewHost(${this.id}) load-resource threw`, {
+				id,
+				uri: uri.toString(true),
+				message: error instanceof Error ? error.message : String(error)
+			});
+			console.error(`[WebviewHost] load-resource threw`, {
+				id,
+				webview: this.id,
+				uri: uri.toString(true),
+				error
+			});
 		}
+
+		this._logService.error(`WebviewHost(${this.id}) load-resource failed`, {
+			id,
+			uri: uri.toString(true),
+			result: loadResult ? WebviewResourceResponse.Type?.[loadResult.type] ?? loadResult.type : 'undefined'
+		});
+		console.error(`[WebviewHost] load-resource failed`, {
+			id,
+			webview: this.id,
+			uri: uri.toString(true),
+			resultType: loadResult?.type
+		});
 
 		return this._send('did-load-resource', {
 			id,
